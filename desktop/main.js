@@ -6,10 +6,14 @@
  * The page gets no Node access (sandboxed, context-isolated). It can only reach
  * the two GitHub hosts that "Add from GitHub" needs; every other request is
  * blocked, and links open in the default browser instead of inside the app.
+ * desktop/preload.js gives it two calls: open the skills folder, and the version.
  */
 
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
-const { app, BrowserWindow, Menu, nativeTheme, session, shell } = require('electron');
+const { pathToFileURL } = require('url');
+const { app, BrowserWindow, Menu, ipcMain, nativeTheme, session, shell } = require('electron');
 
 const APP_DIR = path.join(__dirname, '..', 'apps', 'skill-connector');
 const ICON = path.join(__dirname, 'app.ico');
@@ -39,6 +43,23 @@ function lockDownSession() {
   });
 }
 
+/** Only the app's own page may use the desktop bridge (desktop/preload.js). */
+function fromAppPage(event) {
+  const frameUrl = event.senderFrame && event.senderFrame.url;
+  return Boolean(frameUrl) && frameUrl.split('#')[0] === pathToFileURL(path.join(APP_DIR, 'index.html')).href;
+}
+
+function registerBridge() {
+  ipcMain.handle('csc:open-skills-folder', async (event) => {
+    if (!fromAppPage(event)) return { error: 'Not allowed' };
+    const folder = path.join(os.homedir(), '.claude', 'skills');
+    fs.mkdirSync(folder, { recursive: true });
+    const error = await shell.openPath(folder);
+    return error ? { error } : { ok: true, folder };
+  });
+  ipcMain.handle('csc:version', (event) => (fromAppPage(event) ? app.getVersion() : ''));
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1280,
@@ -54,6 +75,7 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: true,
       spellcheck: false,
+      preload: path.join(__dirname, 'preload.js'),
     },
   });
   win.once('ready-to-show', () => win.show());
@@ -90,6 +112,7 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(() => {
     if (process.platform !== 'darwin') Menu.setApplicationMenu(null);
     lockDownSession();
+    registerBridge();
     createWindow();
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();

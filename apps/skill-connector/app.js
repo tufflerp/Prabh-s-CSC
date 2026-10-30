@@ -17,13 +17,30 @@
   const ALLOWLIST = window.SKILL_SCAN_ALLOWLIST || [];
   const Zip = window.ZipStore;
 
-  const bundled = (window.SKILLS || []).map((s) => Object.assign({}, s, { id: s.dir, source: 'bundled' }));
+  // Bundled skills carry the findings of the build-time scan (reviewed exceptions marked "allowed").
+  const bundled = (window.SKILLS || []).map((s) => Object.assign({}, s, { id: s.dir, source: 'bundled', findings: s.findings || [], status: statusOf(s.findings || []) }));
   let github = [];
   let custom = []; // skills made in the app (Skill maker)
   let local = []; // installed in Claude but not part of this library
   let byId = new Map();
   const selected = new Set();
-  const state = { view: 'all', mode: 'install', query: '', open: { app: false, terminal: false }, showAllTags: false };
+  const state = {
+    view: 'home',
+    mode: 'install',
+    query: '',
+    open: { app: false, terminal: false },
+    showAllTags: false,
+    filters: { category: '', status: '', sort: 'name' },
+    historyFilter: { type: '', target: '' },
+  };
+  // Views that show a page instead of the skill grid and install panel.
+  const PAGE_VIEWS = new Set(['home', 'projects', 'updates', 'security', 'settings']);
+  const APP_INFO = window.CSC_APP || { version: '', homepage: '' };
+  // Desktop app only: a narrow bridge from desktop/preload.js (no Node access in the page).
+  const DESKTOP = window.cscDesktop || null;
+
+  const DEFAULT_SETTINGS = { startView: 'home', backupsKept: 3, allowUnverified: true, autoCheckWatched: true, confirmRemove: true, defaultTargetId: '' };
+  let settings = { ...DEFAULT_SETTINGS };
 
   const $ = (id) => document.getElementById(id);
   const grid = $('grid');
@@ -107,6 +124,136 @@
     return `${n} ${word}${n === 1 ? '' : 's'}`;
   }
 
+  function formatBytes(n) {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10240 ? 1 : 0)} KB`;
+    return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  }
+
+  function formatDate(value) {
+    if (!value) return '';
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? '' : d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+  }
+
+  function timeAgo(value) {
+    const ms = Date.now() - new Date(value).getTime();
+    if (!Number.isFinite(ms)) return '';
+    const min = Math.round(ms / 60000);
+    if (min < 1) return 'just now';
+    if (min < 60) return `${min} min ago`;
+    const h = Math.round(min / 60);
+    if (h < 24) return `${h} h ago`;
+    const days = Math.round(h / 24);
+    return days < 30 ? `${days} day${days === 1 ? '' : 's'} ago` : formatDate(value);
+  }
+
+  function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  /** Inline Markdown on already-escaped text: code, bold, italics, and http(s) links only. */
+  function mdInline(escaped) {
+    const codes = [];
+    let out = escaped.replace(/`([^`]+)`/g, (m, c) => `\u0000${codes.push(c) - 1}\u0000`);
+    out = out
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (m, label, href) => `<a href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`)
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, '$1<em>$2</em>')
+      .replace(/(^|[^_\w])_([^_\n]+)_(?!\w)/g, '$1<em>$2</em>');
+    return out.replace(/\u0000(\d+)\u0000/g, (m, i) => `<code>${codes[Number(i)]}</code>`);
+  }
+
+  /**
+   * Small, safe Markdown renderer for previews: everything is escaped first, so
+   * skill content can never inject markup or scripts. Handles headings, lists,
+   * code blocks, quotes, tables, rules and paragraphs.
+   */
+  function renderMarkdown(text) {
+    const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
+    const html = [];
+    let i = 0;
+    const isTableSep = (l) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(l);
+    const cells = (l) => l.trim().replace(/^\||\|$/g, '').split('|').map((c) => mdInline(escapeHtml(c.trim())));
+    while (i < lines.length) {
+      const line = lines[i];
+      const fence = line.match(/^\s*(```|~~~)/);
+      if (fence) {
+        const code = [];
+        i++;
+        while (i < lines.length && !lines[i].trim().startsWith(fence[1])) code.push(lines[i++]);
+        i++;
+        html.push(`<pre><code>${escapeHtml(code.join('\n'))}</code></pre>`);
+        continue;
+      }
+      if (!line.trim()) { i++; continue; }
+      const heading = line.match(/^(#{1,6})\s+(.*)$/);
+      if (heading) {
+        const level = Math.min(heading[1].length, 4);
+        html.push(`<h${level}>${mdInline(escapeHtml(heading[2].replace(/\s+#+\s*$/, '')))}</h${level}>`);
+        i++;
+        continue;
+      }
+      if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { html.push('<hr>'); i++; continue; }
+      if (line.includes('|') && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+        const head = cells(line);
+        i += 2;
+        const rows = [];
+        while (i < lines.length && lines[i].includes('|') && lines[i].trim()) rows.push(cells(lines[i++]));
+        html.push(`<table><thead><tr>${head.map((c) => `<th>${c}</th>`).join('')}</tr></thead><tbody>${rows.map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table>`);
+        continue;
+      }
+      if (/^\s*>/.test(line)) {
+        const quote = [];
+        while (i < lines.length && /^\s*>/.test(lines[i])) quote.push(lines[i++].replace(/^\s*>\s?/, ''));
+        html.push(`<blockquote>${mdInline(escapeHtml(quote.join(' ')))}</blockquote>`);
+        continue;
+      }
+      const listItem = /^\s*(?:[-*+]|\d+[.)])\s+/;
+      if (listItem.test(line)) {
+        const ordered = /^\s*\d+[.)]/.test(line);
+        const items = [];
+        while (i < lines.length && (listItem.test(lines[i]) || (/^\s{2,}\S/.test(lines[i]) && items.length))) {
+          if (listItem.test(lines[i])) items.push(lines[i].replace(listItem, ''));
+          else items[items.length - 1] += ` ${lines[i].trim()}`;
+          i++;
+        }
+        const tag = ordered ? 'ol' : 'ul';
+        html.push(`<${tag}>${items.map((it) => `<li>${mdInline(escapeHtml(it.replace(/^\[( |x)\]\s+/i, (m, x) => (x.trim() ? '☑ ' : '☐ '))))}</li>`).join('')}</${tag}>`);
+        continue;
+      }
+      const para = [];
+      while (i < lines.length && lines[i].trim() && !/^(#{1,6}\s|\s*(```|~~~)|\s*>|\s*(?:[-*+]|\d+[.)])\s+)/.test(lines[i])) para.push(lines[i++].trim());
+      if (!para.length) para.push(lines[i++].trim());
+      html.push(`<p>${mdInline(escapeHtml(para.join(' ')))}</p>`);
+    }
+    return html.join('\n');
+  }
+
+  /** Categories of a library skill: from the build for bundled skills, otherwise from its own text. */
+  function categoriesOf(skill) {
+    if (!skill.categories) skill.categories = Scan.categorize(skill.name, skill.description);
+    return skill.categories;
+  }
+
+  /** Security summary of a skill's findings (cached on the skill). */
+  function reportOf(skill) {
+    const findings = skill.findings || [];
+    if (!skill.report || skill.report.n !== findings.length) skill.report = Object.assign(Scan.summarizeFindings(findings), { n: findings.length });
+    return skill.report;
+  }
+
+  function needsReview(skill) {
+    return ['critical', 'high', 'warning'].includes(reportOf(skill).level);
+  }
+
+  /** When a skill last changed, where known: installed copy, import or save time. */
+  function updatedTime(skill) {
+    const info = installed.get(skill.installDir);
+    const times = [info && installState(skill) ? info.modified : 0, Date.parse(skill.addedAt || '') || 0, Date.parse(skill.updatedAt || '') || 0];
+    return Math.max(...times);
+  }
+
   function showToast(message, ms) {
     toast.textContent = message;
     // Re-show as a popover so the toast lands above any open dialog.
@@ -159,8 +306,89 @@
     return f ? `${f.message}${f.file && f.file !== '.' ? ` (${f.file})` : ''}` : '';
   }
 
+  // ---------------------------------------------------------- security report
+
+  const RISK_LABEL = { critical: 'Critical', high: 'High', warning: 'Warning', info: 'Info', clean: 'Clean' };
+  const KIND_LABEL = { threat: 'Detected threat pattern', suspicious: 'Suspicious pattern', unverified: "Couldn't be checked", compat: 'Compatibility', reviewed: 'Reviewed exception', info: 'Informational' };
+  const LEVEL_TEXT = {
+    critical: 'Critical risk: dangerous behaviour was detected',
+    high: 'High risk: review before installing',
+    warning: 'Review recommended',
+    info: 'No risky patterns found (informational notes only)',
+    clean: 'No known risky patterns found',
+  };
+
+  function riskBadge(level) {
+    return el('span', `risk ${level}`, RISK_LABEL[level]);
+  }
+
+  function labelled(label, text) {
+    const p = el('p');
+    p.appendChild(el('strong', null, `${label}: `));
+    p.appendChild(document.createTextNode(text));
+    return p;
+  }
+
+  /**
+   * A security report: overall risk, then each finding with its tier, what was
+   * detected, where, why it matters and what to do. `opts.onView(file, line)`
+   * adds a View button for files that `opts.canView(file)` can show.
+   */
+  function renderReport(findings, opts) {
+    const options = opts || {};
+    const report = Scan.summarizeFindings(findings);
+    const wrap = el('div', 'report');
+    const summary = el('div', `report-summary ${report.level}`);
+    summary.appendChild(riskBadge(report.level));
+    summary.appendChild(el('span', 'level', LEVEL_TEXT[report.level]));
+    const counts = el('div', 'counts');
+    for (const k of ['critical', 'high', 'warning', 'info']) {
+      if (report.counts[k]) counts.appendChild(el('span', 'pill', `${report.counts[k]} ${RISK_LABEL[k].toLowerCase()}`));
+    }
+    summary.appendChild(counts);
+    wrap.appendChild(summary);
+    for (const f of report.findings) {
+      const card = el('div', 'finding');
+      const head = el('div', 'finding-head');
+      head.appendChild(riskBadge(f.risk));
+      head.appendChild(el('span', 'finding-title', f.title));
+      head.appendChild(el('span', 'finding-kind', KIND_LABEL[f.kind] || ''));
+      const where = el('span', 'finding-where');
+      if (f.file && f.file !== '.') {
+        where.appendChild(el('code', null, f.file + (f.line ? `:${f.line}` : '')));
+        if (options.onView && (!options.canView || options.canView(f.file))) {
+          const view = el('button', 'btn btn-sm btn-ghost', 'View');
+          view.type = 'button';
+          view.setAttribute('aria-label', `View ${f.file}${f.line ? ` line ${f.line}` : ''}`);
+          view.addEventListener('click', () => options.onView(f.file, f.line));
+          where.appendChild(view);
+        }
+      }
+      head.appendChild(where);
+      card.appendChild(head);
+      if (f.message && f.message !== f.title) card.appendChild(labelled('Detected', f.message));
+      if (f.why) card.appendChild(labelled('Why it matters', f.why));
+      if (f.action) card.appendChild(labelled('Recommended', f.action));
+      wrap.appendChild(card);
+    }
+    wrap.appendChild(el('p', 'report-note', 'The scan runs on this computer and looks for known risky patterns. A clean result is not a guarantee that a skill is safe. Nothing is removed or changed automatically.'));
+    return wrap;
+  }
+
   const decoder = new TextDecoder('utf-8');
   const encoder = new TextEncoder();
+
+  /** Scan a skill's files ([{ path, bytes }]) the same way the build and GitHub import do. */
+  async function scanFiles(dir, files) {
+    const findings = [];
+    for (const f of files) {
+      findings.push(...Scan.inspectPath(f.path).filter((x) => x.severity === 'block'));
+      findings.push(...Scan.inspectFile(f.path, f.bytes));
+    }
+    if (!files.some((f) => f.path === 'SKILL.md')) findings.push({ severity: 'invalid', rule: 'missing-skill-md', file: '.', line: 0, message: 'Folder has no SKILL.md' });
+    await applyAllowlist(dir, files, findings);
+    return findings;
+  }
 
   /** Normalise SKILL.md so Claude Code reads the frontmatter (no BOM before ---). */
   function normalizeSkillMd(text) {
@@ -388,7 +616,9 @@
   let busy = false; // an install or download is running
   function setBusy(value) {
     busy = value;
-    if (typeof renderStatus === 'function') renderStatus();
+    // Pages show busy-dependent buttons, so redraw them; elsewhere only the status box changes.
+    if (PAGE_VIEWS.has(state.view) && typeof renderAll === 'function') renderAll();
+    else if (typeof renderStatus === 'function') renderStatus();
   }
 
   // Where skills install: the personal folder (~/.claude/skills, every project) or a
@@ -567,7 +797,7 @@
     const description = $('maker-description').value.replace(/\s+/g, ' ').trim();
     const text = makerSkillMd();
     const compat = Scan.checkClaudeCompat(text, name || 'new-skill');
-    const findings = Scan.scanText('SKILL.md', text);
+    const findings = makerFindings(text);
     const safety = statusOf(findings);
     const clash = name && library().find((s) => s.installDir === name && s.id !== editingId);
     const ownClash = clash && clash.source === 'custom';
@@ -598,16 +828,176 @@
     if (!body) row(false, 'Instructions', 'Write what Claude should do when it uses this skill');
     if (ownClash) row(false, 'Name in use', `You already made a skill called "${name}". Pick another name, or edit that one instead.`);
     else if (clash) row(null, 'Name in use', `"${name}" is already a skill in the library. Only one of them can be installed at a time.`);
+    row(true, 'Files', `${plural(makerFiles.length + 1, 'file')}, ${formatBytes(makerFiles.reduce((n, f) => n + f.bytes.length, encoder.encode(text).length))}`);
 
     const canSave = validName && description && body && !ownClash && compat.code !== 'error' && safety !== 'blocked';
     $('maker-save').disabled = !canSave;
+    $('maker-export').disabled = !canSave;
     const problems = list.querySelectorAll('li.bad').length;
     $('maker-summary').textContent = canSave ? 'Ready to save.' : `${plural(problems || 1, 'thing')} to fix before saving.`;
     return canSave;
   }
 
+  // Supporting files of the skill being edited ([{ path, bytes }]); SKILL.md is built from the fields.
+  let makerFiles = [];
+  let makerCurrent = 'SKILL.md';
+  let makerView = 'edit';
+
+  /** Safety findings for the SKILL.md being written plus every supporting file. */
+  function makerFindings(skillMdText) {
+    const findings = Scan.scanText('SKILL.md', skillMdText);
+    for (const f of makerFiles) {
+      findings.push(...Scan.inspectPath(f.path).filter((x) => x.severity === 'block'));
+      findings.push(...Scan.inspectFile(f.path, f.bytes));
+    }
+    return findings;
+  }
+
+  function renderMakerFiles() {
+    const tree = $('maker-files');
+    tree.textContent = '';
+    const paths = ['SKILL.md'].concat(makerFiles.map((f) => f.path).sort());
+    for (const path of paths) {
+      const li = el('li');
+      const btn = el('button');
+      btn.type = 'button';
+      btn.setAttribute('aria-current', String(path === makerCurrent));
+      btn.appendChild(el('span', null, path));
+      const file = makerFiles.find((f) => f.path === path);
+      if (file) btn.appendChild(el('span', 'size', formatBytes(file.bytes.length)));
+      btn.addEventListener('click', () => selectMakerFile(path));
+      li.appendChild(btn);
+      tree.appendChild(li);
+    }
+    $('maker-rename-file').disabled = makerCurrent === 'SKILL.md';
+    $('maker-delete-file').disabled = makerCurrent === 'SKILL.md';
+  }
+
+  function selectMakerFile(path) {
+    makerCurrent = path;
+    const isSkillMd = path === 'SKILL.md';
+    $('maker-skillmd').hidden = !isSkillMd;
+    const file = makerFiles.find((f) => f.path === path);
+    if (!isSkillMd && file) {
+      const text = Scan.decodeText(file.bytes);
+      $('maker-file-label').textContent = text === null ? `${path} (binary file: kept as is, not editable here)` : path;
+      $('maker-file-text').value = text === null ? '' : text;
+      $('maker-file-text').disabled = text === null;
+    }
+    renderMakerFiles();
+    renderMakerView();
+  }
+
+  function renderMakerView() {
+    const isSkillMd = makerCurrent === 'SKILL.md';
+    const previewing = makerView === 'preview';
+    $('maker-body-field').hidden = !isSkillMd || previewing;
+    $('maker-file-field').hidden = isSkillMd || previewing;
+    $('maker-preview').hidden = !previewing;
+    document.querySelectorAll('[data-maker-tab]').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.makerTab === makerView)));
+    if (!previewing) return;
+    const preview = $('maker-preview');
+    if (isSkillMd) {
+      preview.innerHTML = renderMarkdown($('maker-body').value);
+    } else {
+      const file = makerFiles.find((f) => f.path === makerCurrent);
+      const text = file ? Scan.decodeText(file.bytes) : null;
+      if (text === null) preview.textContent = 'Binary file: no preview.';
+      else if (/\.(md|mdx|markdown)$/i.test(makerCurrent)) preview.innerHTML = renderMarkdown(text);
+      else {
+        preview.textContent = '';
+        preview.appendChild(el('pre', null, text));
+      }
+    }
+  }
+
+  /** A prompt in the app's own dialog (Electron has no window.prompt). Resolves to the text or null. */
+  function promptDialog(title, sub, value, validate) {
+    const dialog = $('prompt');
+    $('prompt-title').textContent = title;
+    $('prompt-sub').textContent = sub || '';
+    const input = $('prompt-input');
+    input.value = value || '';
+    $('prompt-error').textContent = '';
+    dialog.showModal();
+    input.focus();
+    input.select();
+    return new Promise((resolve) => {
+      const finish = (result) => {
+        $('prompt-form').onsubmit = null;
+        $('prompt-cancel').onclick = null;
+        dialog.onclose = null;
+        if (dialog.open) dialog.close();
+        resolve(result);
+      };
+      $('prompt-form').onsubmit = (e) => {
+        e.preventDefault();
+        const text = input.value.trim();
+        const problem = validate ? validate(text) : '';
+        if (problem) {
+          $('prompt-error').textContent = problem;
+          return;
+        }
+        finish(text);
+      };
+      $('prompt-cancel').onclick = () => finish(null);
+      dialog.onclose = () => finish(null);
+    });
+  }
+
+  /** Why a path can't be used for a new or renamed file, or '' when it can. */
+  function makerPathProblem(path, except) {
+    const p = path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    if (!p) return 'Type a file name.';
+    if (!safeRelativePath(p) || Scan.inspectPath(p).length) return 'Use a plain path such as scripts/helper.py: no "..", and no characters Windows refuses.';
+    if (p.toLowerCase() === 'skill.md') return 'SKILL.md is written from the fields on the left.';
+    const taken = makerFiles.some((f) => f.path !== except && (f.path.toLowerCase() === p.toLowerCase() || f.path.toLowerCase().startsWith(`${p.toLowerCase()}/`) || p.toLowerCase().startsWith(`${f.path.toLowerCase()}/`)));
+    return taken ? 'A file or folder with that name already exists.' : '';
+  }
+
+  async function makerAddFile() {
+    const dir = makerCurrent.includes('/') ? `${makerCurrent.split('/').slice(0, -1).join('/')}/` : '';
+    const path = await promptDialog('New file', 'Path inside the skill, for example scripts/helper.py or references/guide.md.', `${dir}new-file.md`, (p) => makerPathProblem(p));
+    if (!path) return;
+    const clean = path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    makerFiles.push({ path: clean, bytes: new Uint8Array(0) });
+    selectMakerFile(clean);
+    updateMaker();
+  }
+
+  async function makerAddFolder() {
+    const name = await promptDialog('New folder', 'Common folders are scripts, references and assets. An empty .gitkeep file keeps the folder until you add files.', 'references', (p) => (p.replace(/[\\/]/g, '') ? makerPathProblem(`${p}/.gitkeep`) : 'Type a folder name.'));
+    if (!name) return;
+    const clean = `${name.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')}/.gitkeep`;
+    makerFiles.push({ path: clean, bytes: new Uint8Array(0) });
+    selectMakerFile(clean);
+    updateMaker();
+  }
+
+  async function makerRenameFile() {
+    if (makerCurrent === 'SKILL.md') return;
+    const from = makerCurrent;
+    const to = await promptDialog('Rename file', 'Type the new path. Use "/" to move it into a folder.', from, (p) => makerPathProblem(p, from));
+    if (!to) return;
+    const clean = to.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    makerFiles = makerFiles.map((f) => (f.path === from ? { path: clean, bytes: f.bytes } : f));
+    selectMakerFile(clean);
+    updateMaker();
+  }
+
+  async function makerDeleteFile() {
+    if (makerCurrent === 'SKILL.md') return;
+    const ok = await confirmDialog(`Delete ${makerCurrent}?`, ['The file is removed from this skill when you save.'], 'Delete', null, true);
+    if (!ok) return;
+    makerFiles = makerFiles.filter((f) => f.path !== makerCurrent);
+    selectMakerFile('SKILL.md');
+    updateMaker();
+  }
+
   let makerStart = '';
-  const makerDraft = () => [$('maker-name').value, $('maker-description').value, $('maker-body').value].join('\u0000');
+  const makerDraft = () => [$('maker-name').value, $('maker-description').value, $('maker-body').value]
+    .concat(makerFiles.map((f) => `${f.path}:${Scan.hashText(decoder.decode(f.bytes))}`).sort())
+    .join('\u0000');
 
   /** Close the maker, asking first when there are unsaved changes. */
   async function closeMaker() {
@@ -618,12 +1008,32 @@
     $('maker').close();
   }
 
-  function openMaker(skill) {
-    editingId = skill ? skill.id : null;
-    $('maker-title').textContent = skill ? `Edit ${skill.name}` : 'Create a skill';
-    $('maker-name').value = skill ? skill.name : '';
-    $('maker-description').value = skill ? skill.description : '';
-    $('maker-body').value = skill ? skill.body : MAKER_TEMPLATE;
+  /** Open the editor: blank (null), for a skill you made, or (`asCopy`) for a copy of any skill. */
+  async function openMaker(skill, asCopy) {
+    editingId = skill && !asCopy ? skill.id : null;
+    makerFiles = [];
+    let description = skill ? skill.description : '';
+    let body = skill ? skill.body : MAKER_TEMPLATE;
+    if (skill) {
+      try {
+        const files = skill.source === 'custom' && !asCopy ? skill.files : await filesForSkill(skill);
+        const md = files.find((f) => f.path === 'SKILL.md');
+        if (md) {
+          const parsed = Scan.parseFrontmatter(decoder.decode(md.bytes));
+          description = parsed.attributes.description || description;
+          body = parsed.body;
+        }
+        makerFiles = files.filter((f) => f.path !== 'SKILL.md').map((f) => ({ path: f.path, bytes: f.bytes }));
+      } catch (err) {
+        showToast(`Couldn't load all files: ${err.message}`, 5000);
+      }
+    }
+    $('maker-title').textContent = !skill ? 'Create a skill' : asCopy ? `Edit a copy of ${skill.name}` : `Edit ${skill.name}`;
+    $('maker-name').value = skill ? (asCopy ? skill.installDir : skill.name) : '';
+    $('maker-description').value = description;
+    $('maker-body').value = body;
+    makerView = 'edit';
+    selectMakerFile('SKILL.md');
     updateMaker();
     makerStart = makerDraft();
     if (preview.open) preview.close();
@@ -631,13 +1041,20 @@
     $('maker-name').focus();
   }
 
+  function makerSkillFiles() {
+    const text = makerSkillMd();
+    return [{ path: 'SKILL.md', bytes: encoder.encode(text) }].concat(makerFiles.map((f) => ({ path: f.path, bytes: f.bytes })));
+  }
+
   function saveMaker() {
     if (!updateMaker()) return;
     const text = makerSkillMd();
     const parsed = Scan.parseFrontmatter(text);
     const name = parsed.attributes.name;
-    const bytes = encoder.encode(text);
-    const findings = Scan.scanText('SKILL.md', text);
+    const files = makerSkillFiles();
+    const findings = makerFindings(text);
+    const previous = custom.find((s) => s.id === editingId);
+    const now = new Date().toISOString();
     const skill = {
       id: `custom:${name}`,
       source: 'custom',
@@ -646,10 +1063,12 @@
       installDir: name,
       description: parsed.attributes.description,
       body: parsed.body,
-      files: [{ path: 'SKILL.md', bytes }],
-      fp: Scan.skillFingerprint(text, [{ path: 'SKILL.md', size: bytes.length }]),
+      files,
+      fp: Scan.skillFingerprint(text, files.map((f) => ({ path: f.path, size: f.bytes.length }))),
       findings,
       status: statusOf(findings),
+      addedAt: (previous && previous.addedAt) || now,
+      updatedAt: now,
     };
     if (editingId) selected.delete(editingId);
     custom = custom.filter((s) => s.id !== editingId && s.id !== skill.id).concat(skill);
@@ -658,11 +1077,23 @@
     saveCustom().then((ok) => {
       if (!ok) showToast("This browser didn't let the app save your skill, so it will be gone after you close the app. Install it or download it now.", 8000);
     });
+    logActivity(previous ? 'edit' : 'create', name, `${plural(files.length, 'file')}; safety scan: ${LEVEL_TEXT[Scan.summarizeFindings(findings).level].toLowerCase()}`, needsReview(skill) ? 'warning' : 'ok');
     reindex();
     makerStart = makerDraft();
     $('maker').close();
     renderAll();
     showToast(`Saved ${name} to your library and selected it. Click Install to add it to Claude.`, 4500);
+  }
+
+  async function exportMaker() {
+    if (!updateMaker()) return;
+    const name = $('maker-name').value.trim();
+    try {
+      await saveBlob(Zip.createZip(makerSkillFiles().map((f) => ({ path: `${name}/${f.path}`, data: f.bytes }))), `${name}.zip`);
+      showToast(`Exported ${name}.zip. Unzip it into ${SKILLS_PATH} to install it by hand.`, 4500);
+    } catch (err) {
+      if (!(err && err.name === 'AbortError')) showToast(`Export failed: ${err.message}`, 5000);
+    }
   }
 
   async function deleteCustom(skill) {
@@ -671,6 +1102,7 @@
     custom = custom.filter((s) => s.id !== skill.id);
     selected.delete(skill.id);
     saveCustom();
+    logActivity('delete', skill.name, 'Removed from your library');
     reindex();
     if (preview.open) preview.close();
     renderAll();
@@ -678,7 +1110,8 @@
 
   // -------------------------------------------------------- re-scan installed
 
-  let rescan = new Map(); // installDir -> { status, findings }
+  let rescan = new Map(); // installDir -> { status, findings, checkedAt }
+  let rescanTarget = null; // the folder the results above belong to
 
   /** Run today's safety rules over every installed skill in the current folder. */
   async function rescanInstalled() {
@@ -700,22 +1133,20 @@
         let n = 0;
         for (const [name, handle] of dirs) {
           showToast(`Checking ${name} (${++n} of ${dirs.length})...`, 60000);
-          const files = [];
-          const findings = [];
-          for (const f of await listFolder(handle, '')) {
-            const bytes = new Uint8Array(await (await f.handle.getFile()).arrayBuffer());
-            files.push({ path: f.path, bytes });
-            findings.push(...Scan.inspectPath(f.path).filter((x) => x.severity === 'block'));
-            findings.push(...Scan.inspectFile(f.path, bytes));
-          }
-          await applyAllowlist(name, files, findings);
-          results.set(name, { status: statusOf(findings), findings });
+          const files = await readFolderFiles(handle);
+          const findings = await scanFiles(name, files);
+          results.set(name, { status: statusOf(findings), findings, checkedAt: new Date().toISOString() });
         }
       }
       rescan = results;
-      renderAll();
+      rescanTarget = target.id;
       const count = (st) => [...results.values()].filter((r) => r.status === st).length;
       const problems = [...results.entries()].filter(([, r]) => r.status === 'blocked' || r.status === 'unverified');
+      const flagged = [...results.entries()].filter(([, r]) => ['critical', 'high', 'warning'].includes(Scan.summarizeFindings(r.findings).level));
+      logActivity('scan', `${plural(results.size, 'installed skill')}`, flagged.length
+        ? `${flagged.length} need a look: ${flagged.slice(0, 5).map(([name, r]) => `${name} (${Scan.summarizeFindings(r.findings).level})`).join(', ')}`
+        : 'No risky patterns found', flagged.length ? 'warning' : 'ok', target);
+      renderAll();
       showToast(`Checked ${plural(results.size, 'installed skill')}.`, 2500);
       await messageDialog(
         problems.length ? 'Some installed skills need a look' : 'All installed skills passed',
@@ -734,8 +1165,26 @@
 
   // Every install, update and removal, with what was there before so it can be undone.
   let history = [];
-  const UNDO_BATCHES_KEPT = 3;
   const saveHistory = () => idbPut('history', history);
+
+  // Other activity (imports, skills made or edited, scans, library changes). File
+  // changes with backups stay in `history`; the History view shows both.
+  let activity = [];
+  const saveActivity = () => idbPut('activity', activity);
+  const saveSettings = () => idbPut('settings', settings);
+
+  function logActivity(type, skill, detail, result, target) {
+    activity = [{
+      type,
+      skill,
+      detail: detail || '',
+      result: result || 'ok',
+      time: new Date().toISOString(),
+      targetId: target ? target.id : '',
+      targetLabel: target ? target.label : '',
+    }].concat(activity).slice(0, 200);
+    saveActivity();
+  }
 
   function recordHistory(entries, target) {
     if (!entries.length) return null;
@@ -744,7 +1193,7 @@
       .concat(history)
       .slice(0, 80);
     // Keep backups only for the latest few changes (undo records do not count); older ones stay listed.
-    const recent = [...new Set(history.filter((e) => e.action !== 'undo').map((e) => e.batch))].slice(0, UNDO_BATCHES_KEPT);
+    const recent = [...new Set(history.filter((e) => e.action !== 'undo').map((e) => e.batch))].slice(0, settings.backupsKept);
     history = history.map((e) => (e.action === 'undo' || recent.includes(e.batch) ? e : { ...e, undo: null }));
     saveHistory();
     return batch;
@@ -826,12 +1275,58 @@
   }
 
   async function readSkillMd(dirHandle) {
+    const info = await readSkillMdInfo(dirHandle);
+    return info ? info.text : null;
+  }
+
+  /** SKILL.md text and its last-modified time, or null when it is missing or unreadable. */
+  async function readSkillMdInfo(dirHandle) {
     try {
       const file = await (await dirHandle.getFileHandle('SKILL.md')).getFile();
-      return await file.text();
+      return { text: await file.text(), modified: file.lastModified || 0 };
     } catch {
       return null;
     }
+  }
+
+  /** Every file in an installed skill folder as [{ path, bytes, modified }] (caches skipped). */
+  async function readFolderFiles(dirHandle) {
+    const out = [];
+    for (const f of await listFolder(dirHandle, '')) {
+      const file = await f.handle.getFile();
+      out.push({ path: f.path, bytes: new Uint8Array(await file.arrayBuffer()), modified: file.lastModified || 0 });
+    }
+    return out;
+  }
+
+  // What every connected folder holds: target id -> { state, skills: Map(dir -> { name, modified }), at }.
+  let targetStats = new Map();
+
+  async function readTargetSkills(target) {
+    if ((await target.handle.queryPermission({ mode: 'readwrite' })) !== 'granted') return { state: 'needs-permission', skills: new Map(), at: Date.now() };
+    const skills = new Map();
+    try {
+      const folder = await skillsDirOf(target, false);
+      if (folder) {
+        for await (const [dir, handle] of folder.entries()) {
+          if (handle.kind !== 'directory' || dir.startsWith('.')) continue;
+          const md = await readSkillMdInfo(handle);
+          if (!md) continue;
+          skills.set(dir, { name: Scan.parseFrontmatter(md.text).attributes.name || dir, modified: md.modified });
+        }
+      }
+      return { state: folder ? 'ok' : 'empty', skills, at: Date.now() };
+    } catch (err) {
+      return { state: 'error', error: err.message, skills, at: Date.now() };
+    }
+  }
+
+  /** Refresh the snapshot of every connected folder (no prompts). */
+  async function refreshTargetStats() {
+    if (!SUPPORTS_FOLDER_WRITE) return;
+    const next = new Map();
+    for (const t of targets) next.set(t.id, await readTargetSkills(t));
+    targetStats = next;
   }
 
   /**
@@ -872,15 +1367,16 @@
       const folder = await skillsDirOf(target, false);
       if (folder) for await (const [dir, handle] of folder.entries()) {
         if (handle.kind !== 'directory' || dir.startsWith('.')) continue;
-        const text = await readSkillMd(handle);
-        if (text === null) continue;
-        const parsed = Scan.parseFrontmatter(text);
+        const md = await readSkillMdInfo(handle);
+        if (md === null) continue;
+        const parsed = Scan.parseFrontmatter(md.text);
         const files = await listFolder(handle, '');
         next.set(dir, {
           name: parsed.attributes.name || dir,
           description: parsed.attributes.description || '',
           body: parsed.body,
-          fp: Scan.skillFingerprint(text, files),
+          fp: Scan.skillFingerprint(md.text, files),
+          modified: md.modified,
         });
       }
     } catch {
@@ -888,6 +1384,7 @@
       return;
     }
     installed = next;
+    targetStats.set(target.id, { state: 'ok', skills: new Map([...next].map(([d, i]) => [d, { name: i.name, modified: i.modified }])), at: Date.now() });
     // Folders sharing one skill name: Claude sees duplicates.
     const byName = new Map();
     for (const [dir, info] of installed) byName.set(info.name, (byName.get(info.name) || []).concat(dir));
@@ -957,6 +1454,14 @@
   async function confirmUnverified(picks) {
     const risky = picks.filter((s) => s.status === 'unverified');
     if (!risky.length) return true;
+    if (!settings.allowUnverified) {
+      await messageDialog(
+        `${plural(risky.length, 'skill')} couldn't be fully checked`,
+        ['Your settings only allow skills that were fully checked. Deselect these, or change "Allow skills that couldn\'t be fully checked" in Settings.'],
+        risky.map((s) => `${s.name}: ${firstReason(s, 'unverified')}`)
+      );
+      return false;
+    }
     return confirmDialog(
       `${plural(risky.length, 'skill')} couldn't be checked`,
       ['The safety scan could not inspect everything in these skills, so it cannot tell you they are safe. Only continue if you trust where they came from.'],
@@ -1151,14 +1656,16 @@
     if (busy) return;
     const target = currentTarget();
     if (!target) return;
-    const ok = await confirmDialog(
-      `Remove ${skill.name} from Claude?`,
-      [`This deletes the "${skill.installDir}" folder from ${target.label}. Claude stops using it straight away. You can undo this from History.`],
-      'Remove',
-      null,
-      true
-    );
-    if (!ok) return;
+    if (settings.confirmRemove) {
+      const ok = await confirmDialog(
+        `Remove ${skill.name} from Claude?`,
+        [`This deletes the "${skill.installDir}" folder from ${target.label}. Claude stops using it straight away. A backup is kept, and you can undo this from History.`],
+        'Remove',
+        null,
+        true
+      );
+      if (!ok) return;
+    }
     const folder = await getSkillsFolder(false, true);
     if (!folder) {
       showToast('Reconnect to Claude Code first (sidebar or Installed view).', 4000);
@@ -1472,7 +1979,7 @@
   async function resolveRef(target, signal) {
     if (!target.refParts) {
       const repo = await githubApi(`/repos/${target.owner}/${target.repo}`, signal);
-      return { commit: await githubApi(`/repos/${target.owner}/${target.repo}/commits/${encodeURIComponent(repo.default_branch)}`, signal), path: '' };
+      return { commit: await githubApi(`/repos/${target.owner}/${target.repo}/commits/${encodeURIComponent(repo.default_branch)}`, signal), path: '', ref: repo.default_branch };
     }
     const parts = target.refParts;
     let lastError = null;
@@ -1481,7 +1988,7 @@
         const commit = await githubApi(`/repos/${target.owner}/${target.repo}/commits/${encodeURIComponent(parts.slice(0, take).join('/'))}`, signal);
         let path = parts.slice(take).join('/');
         if (target.blob) path = path.split('/').slice(0, -1).join('/'); // a file link scans its folder
-        return { commit, path };
+        return { commit, path, ref: parts.slice(0, take).join('/') };
       } catch (err) {
         if (!err.status || (err.status !== 404 && err.status !== 422)) throw err;
         lastError = err;
@@ -1517,8 +2024,8 @@
    */
   async function scanGitHub(input, onStatus, signal) {
     const target = parseGitHubUrl(input);
-    onStatus(`Looking up ${target.owner}/${target.repo}...`);
-    const { commit, path: subPath } = await resolveRef(target, signal);
+    onStatus(`Looking up ${target.owner}/${target.repo}...`, 0);
+    const { commit, path: subPath, ref } = await resolveRef(target, signal);
     const sha = commit.sha;
     const tree = await githubApi(`/repos/${target.owner}/${target.repo}/git/trees/${sha}?recursive=1`, signal);
 
@@ -1544,7 +2051,7 @@
       const own = entries.filter((e) => (!root || e.path.startsWith(rootPrefix))
         && !nested.some((n) => e.path.startsWith(`${n}/`)));
       const label = root.split('/').pop() || target.repo;
-      onStatus(`Scanning ${label} (${r + 1} of ${roots.length})...`);
+      onStatus(`Scanning ${label} (${r + 1} of ${roots.length})...`, r / roots.length);
 
       const findings = [];
       const files = [];
@@ -1635,6 +2142,11 @@
         source: 'github',
         origin: `${target.owner}/${target.repo}`,
         commit: sha.slice(0, 7),
+        commitFull: sha,
+        commitDate: (commit.commit && commit.commit.committer && commit.commit.committer.date) || '',
+        root,
+        ref: target.refParts ? ref : '',
+        sourceLink: input.trim(),
         url: `https://github.com/${target.owner}/${target.repo}/tree/${sha}/${root}`,
         name: compat.name,
         dir: compat.installDir,
@@ -1650,7 +2162,7 @@
       });
     }
 
-    return { target, sha, skills: results, totalSkills, truncatedSkills: totalSkills > roots.length };
+    return { target, sha, ref, subPath, commitDate: (commit.commit && commit.commit.committer && commit.commit.committer.date) || '', skills: results, totalSkills, truncatedSkills: totalSkills > roots.length };
   }
 
   const STATUS_ORDER = { blocked: 0, invalid: 1, unverified: 2, warnings: 3, passed: 4 };
@@ -1666,8 +2178,9 @@
         const row = el('label', 'gh-row');
         const box = document.createElement('input');
         box.type = 'checkbox';
-        box.checked = !NOT_INSTALLABLE.has(s.status);
-        box.disabled = NOT_INSTALLABLE.has(s.status);
+        const allowed = !NOT_INSTALLABLE.has(s.status) && (settings.allowUnverified || s.status !== 'unverified');
+        box.checked = allowed;
+        box.disabled = !allowed;
         box.addEventListener('change', updateGitHubAdd);
         box.dataset.id = s.id;
         box.setAttribute('aria-label', `Add ${s.name}`);
@@ -1675,8 +2188,24 @@
 
         const name = el('div', 'gh-row-name', s.name);
         name.appendChild(el('span', `pill ${STATUS[s.status].cls}`, STATUS[s.status].label));
+        name.appendChild(riskBadge(reportOf(s).level));
         row.appendChild(name);
         row.appendChild(el('div', 'gh-row-desc', s.description || 'No description provided.'));
+        row.appendChild(el('div', 'gh-row-meta', `Folder: ${s.root || '(repository root)'} · ${plural(s.files.length, 'file')}, ${formatBytes(s.files.reduce((n, f) => n + f.bytes.length, 0))}`));
+        const inLibrary = github.find((g) => g.installDir === s.installDir && g.id !== s.id) || custom.find((c) => c.installDir === s.installDir);
+        if (inLibrary) row.appendChild(el('div', 'gh-row-meta', `Your library already has a skill named "${s.installDir}" (${inLibrary.source === 'custom' ? 'made by you' : inLibrary.origin}). Only one can be installed.`));
+        if (github.some((g) => g.id === s.id)) row.appendChild(el('div', 'gh-row-meta', 'Already in your library from this folder: adding replaces that copy with this version.'));
+        if (installed.has(s.installDir)) row.appendChild(el('div', 'gh-row-meta', `"${s.installDir}" is installed in ${(currentTarget() || {}).label || 'Claude Code'}. Installing this one will replace it, after a backup.`));
+        if (!allowed && s.status === 'unverified') row.appendChild(el('div', 'gh-row-note unverified', 'Your settings only allow skills that were fully checked.'));
+        const actions = el('div', 'gh-row-actions');
+        const details = el('button', 'link-btn', 'Details and files');
+        details.type = 'button';
+        details.addEventListener('click', (e) => {
+          e.preventDefault();
+          openPreview(s);
+        });
+        actions.appendChild(details);
+        row.appendChild(actions);
         if (s.status === 'blocked') row.appendChild(el('div', 'gh-row-note blocked', `Can't be installed: ${firstReason(s, 'block')}`));
         if (s.status === 'invalid') row.appendChild(el('div', 'gh-row-note blocked', `Can't be installed: ${firstReason(s, 'invalid')}`));
         if (s.status === 'unverified') row.appendChild(el('div', 'gh-row-note unverified', `Warning: couldn't be checked. ${firstReason(s, 'unverified')}`));
@@ -1696,6 +2225,39 @@
     const n = ghChecked().length;
     $('github-add').disabled = n === 0;
     $('github-add').textContent = n ? `Add ${plural(n, 'skill')} to library` : 'Add to library';
+  }
+
+  function setGitHubProgress(fraction) {
+    $('github-progress').hidden = fraction === null || fraction === undefined;
+    if (fraction !== null && fraction !== undefined) $('github-progress-bar').style.width = `${Math.round(Math.max(0.04, fraction) * 100)}%`;
+  }
+
+  function renderGitHubSource(result) {
+    const box = $('github-source');
+    box.textContent = '';
+    box.hidden = !result;
+    if (!result) return;
+    const { target, sha, ref, subPath, commitDate } = result;
+    const add = (label, value, href) => {
+      const part = el('span');
+      part.appendChild(document.createTextNode(`${label} `));
+      if (href) {
+        const a = el('a', null, value);
+        a.href = href;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        const code = el('code');
+        code.appendChild(a);
+        part.appendChild(code);
+      } else part.appendChild(el('code', null, value));
+      box.appendChild(part);
+    };
+    add('Repository', `${target.owner}/${target.repo}`, `https://github.com/${target.owner}/${target.repo}`);
+    add('Author', target.owner, `https://github.com/${target.owner}`);
+    if (ref) add('Branch', ref);
+    add('Commit', sha.slice(0, 7), `https://github.com/${target.owner}/${target.repo}/commit/${sha}`);
+    if (commitDate) add('Committed', formatDate(commitDate));
+    if (subPath) add('Folder', subPath);
   }
 
   function setGitHubStatus(text, kind) {
@@ -1718,11 +2280,18 @@
     const input = $('github-url').value;
     ghFound = [];
     renderGitHubResults();
+    renderGitHubSource(null);
     $('github-scan').disabled = true;
     try {
       $('github-watch').hidden = true;
-      const { skills, totalSkills, truncatedSkills, sha } = await scanGitHub(input, (text) => setGitHubStatus(text, 'busy'), controller.signal);
+      const result = await scanGitHub(input, (text, fraction) => {
+        setGitHubStatus(text, 'busy');
+        setGitHubProgress(fraction);
+      }, controller.signal);
+      const { skills, totalSkills, truncatedSkills, sha } = result;
       if (controller.signal.aborted) return;
+      setGitHubProgress(null);
+      renderGitHubSource(result);
       ghFound = skills;
       const counts = skills.reduce((acc, s) => Object.assign(acc, { [s.status]: (acc[s.status] || 0) + 1 }), {});
       const parts = [`Found ${plural(totalSkills, 'skill')}`];
@@ -1740,6 +2309,7 @@
       $('github-watch').disabled = Boolean(known);
       if (counts.unverified) showToast(`Heads up: ${plural(counts.unverified, 'skill')} couldn't be checked for safety.`, 4000);
     } catch (err) {
+      setGitHubProgress(null);
       if (err && err.name === 'AbortError') return;
       setGitHubStatus(`Couldn't scan this link. ${err.message}`, 'error');
     } finally {
@@ -1763,7 +2333,14 @@
 
   function addGitHubSkills() {
     const ids = new Set(ghChecked());
+    const now = new Date().toISOString();
     const adding = ghFound.filter((s) => ids.has(s.id) && !NOT_INSTALLABLE.has(s.status));
+    adding.forEach((s) => {
+      s.addedAt = now;
+      // Keep the copy being replaced, so it can be restored from Updates.
+      const old = github.find((g) => g.id === s.id);
+      if (old && old.fp !== s.fp) s.previous = snapshotOf(old);
+    });
     const replacing = new Set(adding.map((s) => s.id));
     // A new scan of the same repo and folder replaces the older copy.
     github.filter((s) => replacing.has(s.id)).forEach((s) => selected.delete(s.id));
@@ -1779,6 +2356,10 @@
       saveWatched();
       renderWatchNotice();
     }
+    const skipped = ghFound.length - adding.length;
+    logActivity('import', adding.map((s) => s.name).join(', '),
+      `${lastScan ? lastScan.label : 'GitHub'} at ${adding[0] ? adding[0].commit : '?'}: added ${adding.length}${skipped ? `, ${skipped} not added` : ''}${adding.some((s) => needsReview(s)) ? '; some need a security review' : ''}`,
+      adding.some((s) => s.status === 'unverified' || needsReview(s)) ? 'warning' : 'ok');
     closeGitHub();
     state.view = 'github';
     renderAll();
@@ -1793,6 +2374,7 @@
     selected.delete(skill.id);
     reindex();
     saveGithub();
+    logActivity('library-remove', skill.name, `${skill.origin} at ${skill.commit}`);
     if (preview.open) preview.close();
     renderAll();
     showToast(`Removed ${skill.name} from the library. It is still installed in Claude if you installed it.`, 4000);
@@ -1807,10 +2389,69 @@
     else if (state.view === 'github') pool = github;
     else if (state.view === 'selected') pool = chosen();
     else pool = library();
-    if (!q) return pool;
-    if (q === 'original') return pool.filter((s) => s.original);
-    return pool.filter((s) => s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q)
-      || (s.original && ORIGINAL_LABEL.toLowerCase().includes(q)));
+    let out = pool;
+    if (q === 'original') out = pool.filter((s) => s.original);
+    else if (q) {
+      out = pool.filter((s) => s.name.toLowerCase().includes(q) || (s.description || '').toLowerCase().includes(q)
+        || (s.original && ORIGINAL_LABEL.toLowerCase().includes(q)) || categoriesOf(s).some((c) => c.toLowerCase() === q));
+    }
+    const f = state.filters;
+    if (f.category === '__none') out = out.filter((s) => !categoriesOf(s).length);
+    else if (f.category) out = out.filter((s) => categoriesOf(s).includes(f.category));
+    if (f.status === 'installed') out = out.filter((s) => s.source === 'local' || ['installed', 'update', 'other'].includes(installState(s)));
+    else if (f.status === 'not-installed') out = out.filter((s) => s.source !== 'local' && !installState(s));
+    else if (f.status === 'update') out = out.filter((s) => installState(s) === 'update' || hasGitHubUpdate(s));
+    else if (f.status === 'review') out = out.filter((s) => needsReview(s));
+    if (f.sort === 'category') {
+      const first = (s) => categoriesOf(s)[0] || '￿';
+      out = out.slice().sort((a, b) => first(a).localeCompare(first(b)) || a.name.localeCompare(b.name));
+    } else if (f.sort === 'recent') {
+      out = out.slice().sort((a, b) => updatedTime(b) - updatedTime(a) || a.name.localeCompare(b.name));
+    } else if (state.view !== 'installed') {
+      out = out.slice().sort((a, b) => a.name.localeCompare(b.name));
+    }
+    return out;
+  }
+
+  function filtersActive() {
+    const f = state.filters;
+    return Boolean(state.query.trim() || f.category || f.status);
+  }
+
+  function clearFilters() {
+    state.query = '';
+    search.value = '';
+    state.filters = { category: '', status: '', sort: 'name' };
+    $('filter-status').value = '';
+    $('sort').value = 'name';
+    renderCategoryFilter();
+    keepFocus(() => {
+      renderGrid();
+      renderChips();
+    });
+  }
+
+  /** Category options with counts from the current library. */
+  function renderCategoryFilter() {
+    const select = $('filter-category');
+    const counts = new Map();
+    let none = 0;
+    for (const s of library()) {
+      const cats = categoriesOf(s);
+      if (!cats.length) none++;
+      cats.forEach((c) => counts.set(c, (counts.get(c) || 0) + 1));
+    }
+    select.textContent = '';
+    const opt = (value, text) => {
+      const o = document.createElement('option');
+      o.value = value;
+      o.textContent = text;
+      o.selected = state.filters.category === value;
+      select.appendChild(o);
+    };
+    opt('', 'All categories');
+    Scan.CATEGORY_NAMES.filter((c) => counts.has(c)).forEach((c) => opt(c, `${c} (${counts.get(c)})`));
+    if (none) opt('__none', `Uncategorized (${none})`);
   }
 
   function selectable(skill) {
@@ -1875,7 +2516,12 @@
       empty.appendChild(el('h3', null, title));
       empty.appendChild(el('p', null, text));
     };
-    if (state.query) add('No matching skills', 'Try a different word, or clear the search.');
+    if (filtersActive()) {
+      add('No matching skills', 'Try a different word or filter.');
+      const btn = el('button', 'btn', 'Clear search and filters');
+      btn.addEventListener('click', clearFilters);
+      empty.appendChild(btn);
+    }
     else if (state.view === 'github') add('No GitHub skills yet', 'Use "Add from GitHub" to scan a repository and add its skills.');
     else if (state.view === 'selected') add('Nothing selected yet', 'Pick skills from All skills and they will show up here.');
     else if (state.view === 'installed' && connection === 'unsupported') add('Not available in this browser', IS_IOS || HOSTED ? 'Seeing what is installed needs the Windows download of the app in Edge or Chrome.' : 'Open the app in Microsoft Edge or Google Chrome to connect to Claude Code.');
@@ -1905,39 +2551,111 @@
 
   const ACTION_LABEL = { install: 'Installed', update: 'Updated', remove: 'Removed', undo: 'Undid a change:' };
 
+  const ACTIVITY_LABEL = {
+    import: 'Imported from GitHub',
+    create: 'Created',
+    edit: 'Edited',
+    delete: 'Deleted from library',
+    'library-remove': 'Removed from library',
+    'library-update': 'Updated library copy',
+    restore: 'Restored previous version',
+    scan: 'Security scan of',
+  };
+  const HISTORY_TYPES = [
+    ['', 'All activity'],
+    ['changes', 'Installs, updates and removals'],
+    ['import', 'GitHub imports'],
+    ['made', 'Created and edited skills'],
+    ['scan', 'Security scans'],
+    ['library', 'Library changes'],
+  ];
+
+  function historyTypeOf(entry) {
+    if (entry.kind === 'change') return 'changes';
+    if (entry.type === 'import') return 'import';
+    if (entry.type === 'create' || entry.type === 'edit') return 'made';
+    if (entry.type === 'scan') return 'scan';
+    return 'library';
+  }
+
+  function historyFilters() {
+    const wrap = el('div', 'history-filters');
+    const make = (id, label, options, value, onChange) => {
+      const select = document.createElement('select');
+      select.className = 'select';
+      select.id = id;
+      select.setAttribute('aria-label', label);
+      for (const [v, text] of options) {
+        const o = document.createElement('option');
+        o.value = v;
+        o.textContent = text;
+        o.selected = v === value;
+        select.appendChild(o);
+      }
+      select.addEventListener('change', () => onChange(select.value));
+      wrap.appendChild(select);
+    };
+    make('history-type', 'Show', HISTORY_TYPES, state.historyFilter.type, (v) => {
+      state.historyFilter.type = v;
+      keepFocus(renderGrid);
+    });
+    const folders = [['', 'All folders']].concat(targets.map((t) => [t.id, t.label]));
+    make('history-target', 'Folder', folders, state.historyFilter.target, (v) => {
+      state.historyFilter.target = v;
+      keepFocus(renderGrid);
+    });
+    return wrap;
+  }
+
   function renderHistory() {
     grid.textContent = '';
     const title = $('results-title');
     title.textContent = '';
-    const changes = history.filter((e) => e.action !== 'undo');
-    title.appendChild(el('strong', null, String(changes.length)));
-    title.appendChild(document.createTextNode(changes.length === 1 ? ' change' : ' changes'));
-    if (!history.length) {
+    // One timeline: file-change batches (undoable) and other activity, newest first.
+    const groups = [...new Set(history.map((e) => e.batch))].map((batch) => {
+      const entries = history.filter((e) => e.batch === batch);
+      return { kind: 'change', batch, entries, time: entries[0].time, targetId: entries[0].targetId };
+    }).concat(activity.map((a) => ({ kind: 'activity', ...a })));
+    const f = state.historyFilter;
+    const shown = groups
+      .filter((g) => !f.type || historyTypeOf(g) === f.type)
+      .filter((g) => !f.target || g.targetId === f.target)
+      .sort((a, b) => Date.parse(b.time) - Date.parse(a.time));
+    title.appendChild(el('strong', null, String(shown.length)));
+    title.appendChild(document.createTextNode(shown.length === 1 ? ' entry' : ' entries'));
+    if (groups.length) grid.appendChild(historyFilters());
+    if (!shown.length) {
       const empty = el('div', 'empty');
-      empty.appendChild(el('h3', null, 'No changes yet'));
-      empty.appendChild(el('p', null, 'Installs, updates and removals show up here, and the latest one can be undone.'));
+      empty.appendChild(el('h3', null, groups.length ? 'Nothing matches these filters' : 'No changes yet'));
+      empty.appendChild(el('p', null, 'Installs, updates, removals, imports, created skills and security scans show up here. Recent installs, updates and removals can be undone.'));
       grid.appendChild(empty);
       return;
     }
     const undoable = undoableBatch();
     const list = el('div', 'history-list');
-    const batches = [...new Set(history.map((e) => e.batch))];
-    for (const batch of batches) {
-      const entries = history.filter((e) => e.batch === batch);
+    for (const g of shown) {
       const group = el('div', 'history-group');
       const head = el('div', 'history-head');
-      head.appendChild(el('span', 'history-time', new Date(entries[0].time).toLocaleString()));
-      head.appendChild(el('span', 'pill', entries[0].targetLabel || 'Claude Code'));
-      if (entries.every((e) => e.undone)) head.appendChild(el('span', 'pill', 'Undone'));
-      if (batch === undoable) {
-        const undo = el('button', 'btn', 'Undo');
-        undo.dataset.focusKey = `undo:${batch}`;
-        undo.addEventListener('click', () => undoBatch(batch));
-        head.appendChild(undo);
+      head.appendChild(el('span', 'history-time', new Date(g.time).toLocaleString()));
+      const ul = el('ul', 'history-items');
+      if (g.kind === 'change') {
+        head.appendChild(el('span', 'pill', g.entries[0].targetLabel || 'Claude Code'));
+        if (g.entries.every((e) => e.undone)) head.appendChild(el('span', 'pill', 'Undone'));
+        else if (g.entries.some((e) => e.undo) && g.entries[0].action !== 'undo') head.appendChild(el('span', 'pill', 'Backup kept'));
+        if (g.batch === undoable) {
+          const undo = el('button', 'btn', 'Undo');
+          undo.dataset.focusKey = `undo:${g.batch}`;
+          undo.addEventListener('click', () => undoBatch(g.batch));
+          head.appendChild(undo);
+        }
+        for (const e of g.entries) ul.appendChild(el('li', e.undone ? 'undone' : null, `${ACTION_LABEL[e.action] || e.action} ${e.skill}`));
+      } else {
+        head.appendChild(el('span', `pill ${g.result === 'ok' ? '' : g.result === 'failed' ? 'pill-blocked' : 'pill-unverified'}`, g.result === 'ok' ? 'Done' : g.result === 'failed' ? 'Failed' : 'Needs a look'));
+        if (g.targetLabel) head.appendChild(el('span', 'pill', g.targetLabel));
+        ul.appendChild(el('li', null, `${ACTIVITY_LABEL[g.type] || g.type} ${g.skill}`));
+        if (g.detail) ul.appendChild(el('li', null, g.detail));
       }
       group.appendChild(head);
-      const ul = el('ul', 'history-items');
-      for (const e of entries) ul.appendChild(el('li', e.undone ? 'undone' : null, `${ACTION_LABEL[e.action] || e.action} ${e.skill}`));
       group.appendChild(ul);
       list.appendChild(group);
     }
@@ -1950,6 +2668,8 @@
     $('clear').hidden = historyView;
     document.querySelector('.composer').hidden = historyView;
     $('chips').hidden = historyView;
+    $('filters').hidden = historyView;
+    $('clear-filters').hidden = !(filtersActive() || state.filters.sort !== 'name');
     $('rescan').hidden = !(state.view === 'installed' && connection === 'connected' && installed.size);
     if (historyView) {
       renderHistory();
@@ -2003,6 +2723,8 @@
       if (ip) pills.appendChild(ip);
       const checked = state.view === 'installed' && rescan.get(s.installDir);
       if (checked) pills.appendChild(el('span', `pill ${STATUS[checked.status].cls}`, `Re-scan: ${STATUS[checked.status].label}`));
+      if (s.source === 'bundled' && needsReview(s)) pills.appendChild(el('span', 'pill pill-info', 'Security notes'));
+      if (hasGitHubUpdate(s)) pills.appendChild(el('span', 'pill pill-info', 'New version on GitHub'));
       if (pills.childNodes.length) main.appendChild(pills);
       const desc = el('div', 'card-desc', s.description || 'No description provided.');
       desc.id = descId;
@@ -2010,10 +2732,11 @@
       card.appendChild(main);
 
       const foot = el('div', 'card-foot');
-      const view = withIcon(el('button', 'btn btn-ghost'), ICONS.eye, 'Preview');
+      foot.appendChild(el('span', 'card-cats', s.source === 'local' ? 'Installed outside this library' : categoriesOf(s).join(' · ')));
+      const view = withIcon(el('button', 'btn btn-ghost'), ICONS.eye, 'Details');
       view.tabIndex = -1; // keyboard users press P on the card; keeps one Tab stop per card
       view.dataset.focusKey = `preview:${s.id}`;
-      view.setAttribute('aria-label', `Preview ${s.name}`);
+      view.setAttribute('aria-label', `Details for ${s.name}`);
       view.addEventListener('click', (e) => {
         e.stopPropagation();
         openPreview(s.id);
@@ -2389,22 +3112,45 @@
     $('count-selected').textContent = String(selected.size);
     $('count-github').textContent = String(github.length);
     $('count-installed').textContent = connection === 'connected' ? String(installed.size) : '-';
-    $('count-history').textContent = String(history.filter((e) => e.action !== 'undo').length);
+    $('count-history').textContent = String(history.filter((e) => e.action !== 'undo').length + activity.length);
+    $('count-projects').textContent = String(targets.filter((t) => t.kind === 'project').length);
+    const updates = updateCount();
+    $('count-updates').textContent = String(updates);
+    $('count-updates').classList.toggle('alert', updates > 0);
+    const review = library().filter(needsReview).length + [...rescan.values()].filter((r) => ['critical', 'high'].includes(Scan.summarizeFindings(r.findings).level)).length;
+    $('count-security').textContent = String(review);
     document.querySelectorAll('.nav-item[data-view]').forEach((item) => {
       item.setAttribute('aria-current', String(item.getAttribute('data-view') === state.view));
     });
-    $('eyebrow').textContent = { selected: 'Your selection', github: 'Added from GitHub', installed: `Installed in ${(currentTarget() || {}).label || 'Claude Code'}`, history: 'Install history' }[state.view] || 'Skills library';
+    $('eyebrow').textContent = { selected: 'Your selection', github: 'Imported from GitHub', installed: `Installed in ${(currentTarget() || {}).label || 'Claude Code'}`, history: 'Activity' }[state.view] || 'Skills library';
+    $('lib-title').textContent = { selected: 'Selected skills', github: 'GitHub skills', installed: 'Installed skills', history: 'History' }[state.view] || 'Skills for Claude Code';
     renderStatus();
     updateJump();
   }
 
   function renderAll() {
+    const pageMode = PAGE_VIEWS.has(state.view);
+    $('app').classList.toggle('page-mode', pageMode);
+    $('lib').hidden = pageMode;
+    $('page').hidden = !pageMode;
     keepFocus(() => {
       renderNav();
-      renderGrid();
-      renderConnect();
+      if (pageMode) renderPage();
+      else {
+        renderCategoryFilter();
+        renderGrid();
+        renderConnect();
+      }
       if (preview.open && previewId) syncPreviewButtons();
     });
+  }
+
+  /** Switch view (sidebar or a link inside a page) and start at the top. */
+  function goTo(view) {
+    state.view = view;
+    renderAll();
+    $('main').scrollTop = 0;
+    window.scrollTo(0, 0);
   }
 
   function appIssues(skill) {
@@ -2424,45 +3170,350 @@
     return first ? `I'd like help with something this covers: ${first}.` : `Use the ${s.name} skill to help me with my current task.`;
   }
 
-  function openPreview(id) {
-    const s = byId.get(id);
+  // ------------------------------------------------------------ skill detail
+
+  let previewSkill = null; // the skill shown; may be a GitHub scan result not yet in the library
+  let previewFiles = null; // [{ path, bytes, modified? }] once loaded
+  let previewFindings = null; // findings for exactly those files
+  let previewToken = 0;
+  let previewFile = null;
+  let previewRaw = false;
+  const fileCache = new Map(); // recent bundled skills' decoded files
+
+  const SOURCE_LABEL = { bundled: 'Prabh’s CSC library', github: 'GitHub', custom: 'Made by you', local: 'Installed in Claude Code (not in this library)' };
+
+  function installPathOf(target, dir) {
+    if (!target) return '';
+    const sep = IS_WINDOWS ? '\\' : '/';
+    const base = target.kind === 'project' ? `${target.handle.name}${sep}${SKILLS_PATH}` : (IS_WINDOWS ? `%USERPROFILE%\\${SKILLS_PATH}` : `~/${SKILLS_PATH}`);
+    return `${base}${sep}${dir}`;
+  }
+
+  function openPreview(idOrSkill, tab) {
+    const s = typeof idOrSkill === 'string' ? byId.get(idOrSkill) : idOrSkill;
     if (!s) return;
-    previewId = id;
+    previewId = byId.get(s.id) === s ? s.id : null;
+    previewSkill = s;
+    previewFiles = null;
+    previewFindings = null;
+    previewFile = null;
+    previewRaw = false;
     $('preview-title').textContent = s.name;
     const origin = { github: ` (from ${s.origin}, commit ${s.commit || '?'})`, local: ' (installed in Claude Code, not part of this library)' }[s.source] || '';
     $('preview-desc').textContent = `${s.description || 'No description provided.'}${origin}`;
-    const findings = $('preview-findings');
-    findings.textContent = '';
-    const head = el('li', 'findings-head');
-    if (s.original) head.appendChild(el('span', 'pill pill-original', ORIGINAL_LABEL));
-    if (s.source === 'github') head.appendChild(el('span', `pill ${STATUS[s.status].cls}`, STATUS[s.status].label));
-    const ip = installPill(s);
-    if (ip) head.appendChild(ip);
-    head.appendChild(el('span', 'pill', `Folder: ${s.installDir}`));
-    findings.appendChild(head);
-    const rescanned = rescan.get(s.installDir);
-    const shownFindings = (s.findings || []).concat(rescanned && installState(s) ? rescanned.findings.map((f) => ({ ...f, message: `Installed copy: ${f.message}` })) : []);
-    shownFindings.forEach((f) => {
-      const li = el('li');
-      const sev = { block: 'Unsafe', invalid: "Claude can't load", unverified: "Couldn't check", warn: 'Note', allowed: 'Reviewed, safe' }[f.severity] || f.severity;
-      li.appendChild(el('strong', null, sev));
-      li.appendChild(el('span', null, f.message));
-      li.appendChild(el('code', null, f.file + (f.line ? `:${f.line}` : '')));
-      findings.appendChild(li);
+    $('preview-try-text').textContent = tryPromptFor(s);
+    renderPreviewOverview();
+    renderPreviewSkillMd();
+    renderPreviewFiles();
+    renderPreviewSecurity();
+    renderPreviewInstall();
+    selectPreviewTab(tab || 'overview');
+    syncPreviewButtons();
+    if (!preview.open) preview.showModal();
+    preview.querySelector('.dialog-body').scrollTop = 0;
+    loadPreviewFiles(s);
+  }
+
+  async function filesForSkill(s) {
+    if (s.source === 'local') {
+      const folder = await getSkillsFolder(false, true);
+      if (!folder) throw new Error("Connect to the folder to see this skill's files.");
+      return readFolderFiles(await folder.getDirectoryHandle(s.installDir));
+    }
+    if (s.source === 'bundled') {
+      if (!fileCache.has(s.id)) {
+        fileCache.set(s.id, await getFiles(s));
+        if (fileCache.size > 6) fileCache.delete(fileCache.keys().next().value);
+      }
+      return fileCache.get(s.id);
+    }
+    return getFiles(s);
+  }
+
+  async function loadPreviewFiles(s) {
+    const token = ++previewToken;
+    try {
+      const files = (await filesForSkill(s)).slice().sort((a, b) => (a.path === 'SKILL.md' ? -1 : b.path === 'SKILL.md' ? 1 : a.path.localeCompare(b.path)));
+      const findings = s.source === 'local' ? await scanFiles(s.installDir, files) : (s.findings || []);
+      if (token !== previewToken) return;
+      previewFiles = files;
+      previewFindings = findings;
+      if (s.source === 'local') s.findings = findings;
+    } catch (err) {
+      if (token !== previewToken) return;
+      previewFiles = [];
+      previewFindings = s.findings || [];
+      previewSkill.loadError = err.message;
+    }
+    renderPreviewOverview();
+    renderPreviewSkillMd();
+    renderPreviewFiles();
+    renderPreviewSecurity();
+    renderPreviewInstall();
+  }
+
+  function selectPreviewTab(tab) {
+    document.querySelectorAll('#preview-tabs [role="tab"]').forEach((b) => {
+      const on = b.dataset.tab === tab;
+      b.setAttribute('aria-selected', String(on));
+      b.tabIndex = on ? 0 : -1;
+      $(`pv-${b.dataset.tab}`).hidden = !on;
     });
+  }
+
+  function skillMdText() {
+    const f = previewFiles && previewFiles.find((x) => x.path === 'SKILL.md');
+    return f ? decoder.decode(f.bytes) : null;
+  }
+
+  function renderPreviewOverview() {
+    const s = previewSkill;
+    const head = $('preview-findings');
+    head.textContent = '';
+    const pills = el('li', 'findings-head');
+    if (s.original) pills.appendChild(el('span', 'pill pill-original', ORIGINAL_LABEL));
+    if (s.source === 'github') pills.appendChild(el('span', `pill ${STATUS[s.status].cls}`, STATUS[s.status].label));
+    const ip = byId.get(s.id) === s ? installPill(s) : null;
+    if (ip) pills.appendChild(ip);
+    pills.appendChild(el('span', 'pill', `Folder: ${s.installDir}`));
+    const level = Scan.summarizeFindings(previewFindings || s.findings || []).level;
+    const sec = el('button', 'link-btn', `Security: ${LEVEL_TEXT[level]}`);
+    sec.type = 'button';
+    sec.addEventListener('click', () => selectPreviewTab('security'));
+    pills.appendChild(sec);
+    head.appendChild(pills);
     appIssues(s).forEach((i) => {
       const li = el('li');
       li.appendChild(el('strong', null, i.target === 'app' ? 'Claude app' : 'Claude Code'));
       li.appendChild(el('span', null, i.message));
-      findings.appendChild(li);
+      head.appendChild(li);
     });
-    $('preview-try-text').textContent = tryPromptFor(s);
-    $('preview-body').textContent = s.body || 'SKILL.md could not be read.';
-    syncPreviewButtons();
-    if (!preview.open) {
-      preview.showModal();
-      preview.querySelector('.dialog-body').scrollTop = 0;
+
+    const meta = $('preview-meta');
+    meta.textContent = '';
+    const row = (label, value) => {
+      if (value === null || value === undefined || value === '') return;
+      meta.appendChild(el('dt', null, label));
+      const dd = el('dd');
+      if (value instanceof Node) dd.appendChild(value);
+      else dd.textContent = value;
+      meta.appendChild(dd);
+    };
+    row('Source', s.source === 'github' ? `${s.origin} (author: ${s.origin.split('/')[0]})` : SOURCE_LABEL[s.source]);
+    if (s.source === 'github') {
+      const link = el('a', 'mono', `${s.commit}${s.commitDate ? ` · ${formatDate(s.commitDate)}` : ''}`);
+      link.href = `https://github.com/${s.origin}/commit/${s.commitFull || s.commit}`;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      row('Commit', link);
+      row('Folder in repository', s.root || '(repository root)');
     }
+    row('Installs as', el('code', null, s.installDir));
+    row('Categories', categoriesOf(s).join(', ') || 'None (no category words in its name or description)');
+    if (s.addedAt) row('Added to library', formatDate(s.addedAt));
+    if (s.updatedAt) row('Last edited', formatDate(s.updatedAt));
+    const info = installed.get(s.installDir);
+    if (info && (s.source === 'local' || installState(s))) row('Installed copy modified', formatDate(info.modified));
+    if (previewFiles) {
+      row('Files', `${plural(previewFiles.length, 'file')}, ${formatBytes(previewFiles.reduce((n, f) => n + f.bytes.length, 0))}`);
+      const text = skillMdText();
+      if (text !== null) {
+        const parsed = Scan.parseFrontmatter(text);
+        row('Description length', `${(parsed.attributes.description || '').length} characters`);
+        for (const [key, value] of Object.entries(parsed.attributes)) {
+          if (key === 'name' || key === 'description') continue;
+          row(`Frontmatter: ${key}`, value.length > 300 ? `${value.slice(0, 300)}...` : value);
+        }
+        const compat = Scan.checkClaudeCompat(text, s.installDir);
+        row('Claude Code', compat.code === 'ready' ? 'Will load this skill' : (compat.issues.find((i) => i.target === 'code' && i.level !== 'info') || {}).message || compat.code);
+      }
+    } else if (s.loadError) row('Files', s.loadError);
+    else row('Files', 'Loading...');
+  }
+
+  function renderPreviewSkillMd() {
+    const s = previewSkill;
+    const full = skillMdText();
+    const body = full !== null ? Scan.parseFrontmatter(full).body : s.body;
+    $('preview-rendered').innerHTML = body ? renderMarkdown(body) : '<p>SKILL.md could not be read.</p>';
+    $('preview-body').textContent = full !== null ? full : (s.body || 'SKILL.md could not be read.');
+    $('preview-rendered').hidden = previewRaw;
+    $('preview-body').hidden = !previewRaw;
+    $('preview-md-toggle').textContent = previewRaw ? 'Show formatted' : 'Show raw text';
+  }
+
+  function worstRiskIn(path) {
+    const order = ['critical', 'high', 'warning'];
+    const risks = Scan.summarizeFindings((previewFindings || []).filter((f) => f.file === path)).findings.map((f) => f.risk);
+    return order.find((r) => risks.includes(r)) || '';
+  }
+
+  function renderPreviewFiles() {
+    const tree = $('preview-files');
+    tree.textContent = '';
+    const view = $('preview-file-view');
+    $('pv-tab-files').textContent = previewFiles ? `Files (${previewFiles.length})` : 'Files';
+    if (!previewFiles) {
+      view.textContent = 'Loading files...';
+      return;
+    }
+    if (!previewFiles.length) {
+      view.textContent = previewSkill.loadError || 'No files.';
+      return;
+    }
+    if (!previewFile || !previewFiles.some((f) => f.path === previewFile)) previewFile = previewFiles[0].path;
+    for (const f of previewFiles) {
+      const li = el('li');
+      const btn = el('button');
+      btn.type = 'button';
+      btn.setAttribute('aria-current', String(f.path === previewFile));
+      const risk = worstRiskIn(f.path);
+      if (risk) {
+        const dot = el('span', `flag ${risk}`);
+        dot.title = `${RISK_LABEL[risk]} finding in this file`;
+        btn.appendChild(dot);
+      }
+      btn.appendChild(el('span', null, f.path));
+      btn.appendChild(el('span', 'size', formatBytes(f.bytes.length)));
+      btn.addEventListener('click', () => {
+        previewFile = f.path;
+        renderPreviewFiles();
+      });
+      li.appendChild(btn);
+      tree.appendChild(li);
+    }
+    renderFileView(view, previewFiles.find((f) => f.path === previewFile), previewFindings || []);
+  }
+
+  const FILE_VIEW_LIMIT = 400 * 1024;
+
+  /** One file with line numbers; lines with findings are highlighted. */
+  function renderFileView(view, file, findings) {
+    view.textContent = '';
+    const head = el('div', 'file-view-head');
+    head.appendChild(el('span', null, file.path));
+    head.appendChild(el('span', null, formatBytes(file.bytes.length)));
+    if (file.modified) head.appendChild(el('span', null, `modified ${formatDate(file.modified)}`));
+    view.appendChild(head);
+    const text = Scan.decodeText(file.bytes.subarray(0, FILE_VIEW_LIMIT));
+    if (text === null) {
+      view.appendChild(el('div', 'panel-empty', 'Binary file: not shown. Its type and contents were checked by the safety scan where possible.'));
+      return;
+    }
+    const hits = new Map();
+    for (const f of Scan.summarizeFindings(findings.filter((x) => x.file === file.path && x.line)).findings) {
+      if (!hits.has(f.line)) hits.set(f.line, f);
+    }
+    const lines = el('div', 'file-lines');
+    text.replace(/\r\n/g, '\n').split('\n').forEach((line, i) => {
+      const hit = hits.get(i + 1);
+      const row = el('div', hit ? `hit ${hit.risk === 'warning' || hit.risk === 'info' ? 'warning' : ''}` : null, line);
+      if (hit) row.title = hit.title;
+      row.dataset.line = String(i + 1);
+      lines.appendChild(row);
+    });
+    view.appendChild(lines);
+    if (file.bytes.length > FILE_VIEW_LIMIT) view.appendChild(el('div', 'code-note', `Showing the first ${formatBytes(FILE_VIEW_LIMIT)}.`));
+  }
+
+  /** Jump from a finding to its file and line. */
+  function viewFileAt(path, line) {
+    previewFile = path;
+    selectPreviewTab('files');
+    renderPreviewFiles();
+    const row = line && document.querySelector(`#preview-file-view .file-lines div[data-line="${line}"]`);
+    if (row) row.scrollIntoView({ block: 'center' });
+  }
+
+  function renderPreviewSecurity() {
+    const s = previewSkill;
+    const box = $('preview-report');
+    box.textContent = '';
+    const findings = previewFindings || s.findings || [];
+    box.appendChild(renderReport(findings, {
+      onView: viewFileAt,
+      canView: (path) => Boolean(previewFiles && previewFiles.some((f) => f.path === path)),
+    }));
+    const rescanned = rescan.get(s.installDir);
+    if (rescanned && (s.source === 'local' || installState(s))) {
+      box.appendChild(el('p', 'section-label', `Installed copy, re-scanned ${formatDate(rescanned.checkedAt)}`));
+      box.lastChild.style.marginTop = '18px';
+      box.appendChild(renderReport(rescanned.findings));
+    }
+  }
+
+  function renderPreviewInstall() {
+    const s = previewSkill;
+    const box = $('preview-install');
+    box.textContent = '';
+    if (!SUPPORTS_FOLDER_WRITE) {
+      box.appendChild(notice('info', ICONS.info, `This browser can't write into folders. Select the skill and use a .zip download from the install panel, then unzip it into ${SKILLS_PATH}.`));
+      return;
+    }
+    const inLibrary = byId.get(s.id) === s;
+    if (!inLibrary) {
+      box.appendChild(notice('info', ICONS.info, 'Add this skill to your library first, then install it from there.'));
+      return;
+    }
+    const target = currentTarget();
+    const meta = el('dl', 'meta-grid');
+    const row = (label, value) => {
+      meta.appendChild(el('dt', null, label));
+      const dd = el('dd');
+      if (value instanceof Node) dd.appendChild(value);
+      else dd.textContent = value;
+      meta.appendChild(dd);
+    };
+    if (!target || connection !== 'connected') {
+      box.appendChild(notice('info', ICONS.info, connection === 'needs-permission' ? 'Allow access to your skills folder again to see where this skill is installed.' : 'Connect to your Claude Code skills folder to install skills and see where they are.'));
+      const btn = el('button', 'btn btn-primary', connection === 'needs-permission' ? 'Reconnect' : 'Connect to Claude Code');
+      btn.addEventListener('click', async () => {
+        await connectFolder(false);
+        renderPreviewInstall();
+      });
+      box.appendChild(btn);
+      return;
+    }
+    const st = s.source === 'local' ? 'installed' : installState(s);
+    const stateText = {
+      installed: 'Installed, same version as the library',
+      update: 'Installed, but a different version: an update is available',
+      elsewhere: `Installed under another folder name: "${otherCopies(s)[0]}"`,
+      other: 'A different skill with this name is installed',
+    }[st] || 'Not installed in this folder';
+    row('Folder', target.label);
+    row('Status', stateText);
+    row('Location', el('code', null, installPathOf(target, s.installDir)));
+    const info = installed.get(s.installDir);
+    if (info && st) row('Last modified', formatDate(info.modified) || 'Unknown');
+    const elsewhere = targets.filter((t) => t.id !== target.id && targetStats.get(t.id) && targetStats.get(t.id).skills.has(s.installDir));
+    row('Other folders', elsewhere.length ? elsewhere.map((t) => t.label).join(', ') : 'Not found in your other connected folders');
+    if (duplicateNames.has(s.name)) row('Duplicates', `Claude sees ${duplicateNames.get(s.name).length} copies named "${s.name}": ${duplicateNames.get(s.name).join(', ')}`);
+    box.appendChild(meta);
+    const actions = el('div', 'install-row');
+    actions.style.gridTemplateColumns = 'repeat(auto-fit, minmax(160px, 1fr))';
+    if (selectable(s)) {
+      const verb = st === 'installed' ? 'Reinstall' : st === 'update' ? 'Update' : 'Install';
+      const btn = withIcon(el('button', 'btn btn-primary'), ICONS.install, `${verb} in ${target.kind === 'project' ? target.handle.name : 'Claude Code'}`);
+      btn.disabled = busy;
+      btn.addEventListener('click', async () => {
+        await installSkills([s], false);
+        renderPreviewInstall();
+      });
+      actions.appendChild(btn);
+    }
+    if (st === 'update') {
+      const cmp = el('button', 'btn', 'Compare versions');
+      cmp.addEventListener('click', () => compareInstalled(s));
+      actions.appendChild(cmp);
+    }
+    if (st && st !== 'elsewhere') {
+      const rm = el('button', 'btn btn-danger-ghost', 'Remove from this folder');
+      rm.addEventListener('click', () => removeInstalled(s));
+      actions.appendChild(rm);
+    }
+    box.appendChild(actions);
+    box.appendChild(el('p', 'report-note', 'Installing never overwrites silently: you are asked first, the current copy is backed up, and the change can be undone from History.'));
   }
 
   function syncPreviewButtons() {
@@ -2471,10 +3522,764 @@
     toggleBtn.hidden = !selectable(s);
     toggleBtn.textContent = selected.has(previewId) ? 'Deselect' : 'Select';
     const st = s && installState(s);
-    $('preview-remove').hidden = !(st && st !== 'elsewhere' && SUPPORTS_FOLDER_WRITE);
+    $('preview-remove').hidden = !(s && (st || s.source === 'local') && st !== 'elsewhere' && SUPPORTS_FOLDER_WRITE);
     $('preview-remove-library').hidden = !(s && s.source === 'github');
     $('preview-edit').hidden = !(s && s.source === 'custom');
     $('preview-delete').hidden = !(s && s.source === 'custom');
+    $('preview-copy-edit').hidden = !(s && s.source !== 'custom');
+  }
+
+  // ---------------------------------------------------------------- compare
+
+  /** Line diff (LCS) as [{ op: ' ' | '+' | '-', text }], or null when too large to compare. */
+  function lineDiff(oldText, newText) {
+    const a = oldText.replace(/\r\n/g, '\n').split('\n');
+    const b = newText.replace(/\r\n/g, '\n').split('\n');
+    if (a.length * b.length > 4000000) return null;
+    const dp = Array.from({ length: a.length + 1 }, () => new Uint32Array(b.length + 1));
+    for (let i = a.length - 1; i >= 0; i--) {
+      for (let j = b.length - 1; j >= 0; j--) dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+    const out = [];
+    let i = 0;
+    let j = 0;
+    while (i < a.length && j < b.length) {
+      if (a[i] === b[j]) { out.push({ op: ' ', text: a[i] }); i++; j++; }
+      else if (dp[i + 1][j] >= dp[i][j + 1]) out.push({ op: '-', text: a[i++] });
+      else out.push({ op: '+', text: b[j++] });
+    }
+    while (i < a.length) out.push({ op: '-', text: a[i++] });
+    while (j < b.length) out.push({ op: '+', text: b[j++] });
+    return out;
+  }
+
+  function sameBytes(x, y) {
+    if (x.length !== y.length) return false;
+    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+    return true;
+  }
+
+  /** Per-file comparison of two versions: added, removed, changed or same. */
+  function compareFiles(oldFiles, newFiles) {
+    const oldMap = new Map(oldFiles.map((f) => [f.path, f]));
+    const newMap = new Map(newFiles.map((f) => [f.path, f]));
+    const paths = [...new Set([...oldMap.keys(), ...newMap.keys()])].sort();
+    return paths.map((path) => {
+      const o = oldMap.get(path);
+      const n = newMap.get(path);
+      const status = !o ? 'added' : !n ? 'removed' : sameBytes(o.bytes, n.bytes) ? 'same' : 'changed';
+      return { path, status, oldFile: o, newFile: n };
+    });
+  }
+
+  function renderDiff(oldText, newText) {
+    const ops = lineDiff(oldText, newText);
+    if (!ops) return el('p', 'report-note', 'Too large to compare line by line.');
+    const box = el('div', 'diff');
+    const CONTEXT = 3;
+    const keep = ops.map((op, i) => op.op !== ' ' || ops.slice(Math.max(0, i - CONTEXT), i + CONTEXT + 1).some((x) => x.op !== ' '));
+    let gap = false;
+    ops.forEach((op, i) => {
+      if (!keep[i]) {
+        if (!gap) box.appendChild(el('div', 'gap', '...'));
+        gap = true;
+        return;
+      }
+      gap = false;
+      box.appendChild(el('div', op.op === '+' ? 'add' : op.op === '-' ? 'del' : null, `${op.op} ${op.text}`));
+    });
+    return box;
+  }
+
+  let compareApply = null;
+
+  /**
+   * Show what changes between two versions of a skill. `opts`: title, subtitle,
+   * oldFiles, newFiles, newFindings (security report of the new version),
+   * applyLabel and onApply.
+   */
+  function openCompare(opts) {
+    $('compare-title').textContent = opts.title;
+    $('compare-sub').textContent = opts.subtitle || '';
+    const body = $('compare-body');
+    body.textContent = '';
+    const changes = compareFiles(opts.oldFiles, opts.newFiles).filter((c) => c.status !== 'same');
+    const count = (st) => changes.filter((c) => c.status === st).length;
+    body.appendChild(el('p', 'section-label', changes.length
+      ? `${plural(changes.length, 'file')} differ: ${count('changed')} changed, ${count('added')} added, ${count('removed')} removed`
+      : 'The files are identical'));
+    const list = el('ul', 'file-changes');
+    changes.forEach((c) => list.appendChild(el('li', c.status, `${{ added: '+', removed: '-', changed: '~' }[c.status]} ${c.path}`)));
+    body.appendChild(list);
+    let shown = 0;
+    for (const c of changes) {
+      if (shown >= 12) {
+        body.appendChild(el('p', 'report-note', 'More changed files are not shown here.'));
+        break;
+      }
+      const oldText = c.oldFile ? Scan.decodeText(c.oldFile.bytes) : '';
+      const newText = c.newFile ? Scan.decodeText(c.newFile.bytes) : '';
+      body.appendChild(el('p', 'section-label', c.path));
+      if (oldText === null || newText === null) body.appendChild(el('p', 'report-note', 'Binary file: not compared line by line.'));
+      else body.appendChild(renderDiff(oldText, newText));
+      shown++;
+    }
+    if (opts.newFindings) {
+      const label = el('p', 'section-label', 'Security report of the new version');
+      label.style.marginTop = '16px';
+      body.appendChild(label);
+      body.appendChild(renderReport(opts.newFindings));
+    }
+    const apply = $('compare-apply');
+    apply.hidden = !opts.onApply;
+    apply.textContent = opts.applyLabel || 'Apply';
+    apply.disabled = false;
+    compareApply = opts.onApply || null;
+    if (!$('compare').open) $('compare').showModal();
+    body.scrollTop = 0;
+  }
+
+  async function compareInstalled(s) {
+    try {
+      const folder = await getSkillsFolder(false, true);
+      if (!folder) throw new Error('Reconnect to the folder first.');
+      const installedFiles = await readFolderFiles(await folder.getDirectoryHandle(s.installDir));
+      const libraryFiles = await getFiles(s);
+      openCompare({
+        title: `${s.name}: installed copy vs library`,
+        subtitle: `Lines marked - are in the installed copy in ${(currentTarget() || {}).label}; lines marked + are in the library version.`,
+        oldFiles: installedFiles,
+        newFiles: libraryFiles,
+        applyLabel: 'Update installed copy',
+        onApply: () => installSkills([s], false),
+      });
+    } catch (err) {
+      showToast(`Couldn't compare: ${err.message}`, 5000);
+    }
+  }
+
+  // ---------------------------------------------------------------- updates
+
+  function hasGitHubUpdate(s) {
+    return Boolean(s && s.source === 'github' && s.updateCheck && s.updateCheck.changed === true);
+  }
+
+  function updateCount() {
+    return (connection === 'connected' ? updatable().length : 0) + github.filter(hasGitHubUpdate).length;
+  }
+
+  function snapshotOf(s) {
+    return {
+      commit: s.commit, commitFull: s.commitFull, commitDate: s.commitDate, fp: s.fp, files: s.files, findings: s.findings,
+      status: s.status, name: s.name, description: s.description, body: s.body, compat: s.compat, skippedFiles: s.skippedFiles, addedAt: s.addedAt,
+    };
+  }
+
+  let ghCheck = null; // { running, at, error, checked }
+
+  /**
+   * Ask GitHub whether imported skills changed: one lookup for each repository and
+   * branch, and one comparison for each imported commit. A skill only counts as
+   * updated when the comparison shows files in its folder changed.
+   */
+  async function checkGitHubUpdates() {
+    if (!github.length || (ghCheck && ghCheck.running)) return;
+    ghCheck = { running: true, at: Date.now(), error: '', checked: 0 };
+    renderAll();
+    const latestFor = new Map();
+    const compareFor = new Map();
+    try {
+      for (const s of github) {
+        const [owner, repo] = s.origin.split('/');
+        const refKey = `${s.origin}@${s.ref || ''}`;
+        if (!latestFor.has(refKey)) {
+          const target = { owner, repo, refParts: s.ref ? s.ref.split('/') : null, path: '', blob: false };
+          latestFor.set(refKey, (await resolveRef(target)).commit.sha);
+        }
+        const latest = latestFor.get(refKey);
+        const base = s.commitFull || s.commit;
+        const check = { checkedAt: new Date().toISOString(), latest, changed: false, files: [] };
+        if (!latest.startsWith(base)) {
+          const cmpKey = `${s.origin}:${base}...${latest}`;
+          if (!compareFor.has(cmpKey)) compareFor.set(cmpKey, await githubApi(`/repos/${owner}/${repo}/compare/${base}...${latest}`));
+          const cmp = compareFor.get(cmpKey);
+          const inFolder = (name) => !s.root || name === s.root || name.startsWith(`${s.root}/`);
+          check.files = (cmp.files || []).filter((f) => inFolder(f.filename) || (f.previous_filename && inFolder(f.previous_filename))).map((f) => `${f.status} ${f.filename}`);
+          // GitHub lists at most 300 files per comparison; beyond that we can't tell.
+          check.changed = check.files.length ? true : (cmp.files || []).length >= 300 ? null : false;
+        }
+        s.updateCheck = check;
+        ghCheck.checked++;
+      }
+    } catch (err) {
+      ghCheck.error = err.message;
+    }
+    ghCheck.running = false;
+    saveGithub();
+    renderAll();
+  }
+
+  /** Download the newer version of an imported skill, scan it, and show what changes. */
+  async function reviewGitHubUpdate(s) {
+    if (!s.updateCheck || busy) return;
+    setBusy(true);
+    showToast(`Downloading and scanning the new version of ${s.name}...`, 60000);
+    try {
+      const link = `https://github.com/${s.origin}/tree/${s.updateCheck.latest}/${s.root || ''}`.replace(/\/$/, '');
+      const result = await scanGitHub(link, () => {});
+      const found = result.skills.find((x) => x.id === s.id) || result.skills.find((x) => x.installDir === s.installDir);
+      if (!found) throw new Error('The skill is no longer in that folder of the repository.');
+      showToast('Ready to review.', 1500);
+      openCompare({
+        title: `${s.name}: update from GitHub`,
+        subtitle: `${s.origin}: ${s.commit} → ${found.commit}. Lines marked - are in your library copy; lines marked + are in the new version.`,
+        oldFiles: s.files,
+        newFiles: found.files,
+        newFindings: found.findings,
+        applyLabel: NOT_INSTALLABLE.has(found.status) ? 'Cannot update: new version is blocked' : 'Update library copy',
+        onApply: NOT_INSTALLABLE.has(found.status) ? null : () => applyGitHubUpdate(s, found),
+      });
+    } catch (err) {
+      showToast(`Couldn't get the new version: ${err.message}`, 6000);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function applyGitHubUpdate(old, found) {
+    const wasInstalled = ['installed', 'update'].includes(installState(old));
+    const next = Object.assign(found, {
+      addedAt: old.addedAt,
+      updatedAt: new Date().toISOString(),
+      sourceLink: old.sourceLink,
+      ref: old.ref,
+      previous: snapshotOf(old),
+      updateCheck: null,
+    });
+    github = github.map((g) => (g.id === old.id ? next : g));
+    reindex();
+    saveGithub();
+    logActivity('library-update', next.name, `${old.origin}: ${old.commit} → ${next.commit}`, needsReview(next) ? 'warning' : 'ok');
+    $('compare').close();
+    renderAll();
+    showToast(`Updated ${next.name} in your library. The previous version can be restored from Updates.`, 5000);
+    if (wasInstalled && SUPPORTS_FOLDER_WRITE && connection === 'connected') {
+      const go = await confirmDialog(`Install the new version of ${next.name}?`, [`It is installed in ${(currentTarget() || {}).label}. The installed copy is backed up first.`], 'Install update');
+      if (go) await installSkills([next], false);
+    }
+  }
+
+  async function restorePrevious(s) {
+    if (!s.previous) return;
+    const ok = await confirmDialog(`Restore the previous version of ${s.name}?`, [`Your library copy goes back to commit ${s.previous.commit}. The current version (${s.commit}) is kept, so you can switch back.`], 'Restore');
+    if (!ok) return;
+    const current = snapshotOf(s);
+    const next = Object.assign({}, s, s.previous, { previous: current, updateCheck: null, report: null, categories: null, updatedAt: new Date().toISOString() });
+    github = github.map((g) => (g.id === s.id ? next : g));
+    reindex();
+    saveGithub();
+    logActivity('restore', s.name, `${current.commit} → ${next.commit}`);
+    renderAll();
+    showToast(`Restored ${s.name} to ${next.commit}. Install it again to update Claude Code.`, 5000);
+  }
+
+  // ------------------------------------------------------------------ pages
+
+  function pageHead(eyebrow, title, sub) {
+    const head = el('div', 'hero');
+    const e = el('div', 'hero-eyebrow');
+    e.appendChild(el('span', 'dot'));
+    e.appendChild(el('span', null, eyebrow));
+    head.appendChild(e);
+    head.appendChild(el('h1', null, title));
+    if (sub) head.appendChild(el('p', 'page-sub', sub));
+    return head;
+  }
+
+  function panel(title, actions) {
+    const box = el('section', 'panel');
+    const head = el('div', 'panel-head');
+    head.appendChild(el('h2', null, title));
+    (actions || []).forEach((a) => head.appendChild(a));
+    box.appendChild(head);
+    return box;
+  }
+
+  function button(label, cls, onClick, id) {
+    const b = el('button', `btn ${cls || ''}`.trim(), label);
+    b.type = 'button';
+    if (id) b.dataset.focusKey = id;
+    b.addEventListener('click', onClick);
+    return b;
+  }
+
+  function statCard(value, label, note, onClick) {
+    const card = el(onClick ? 'button' : 'div', 'stat');
+    if (onClick) {
+      card.type = 'button';
+      card.addEventListener('click', onClick);
+    }
+    card.appendChild(el('span', 'stat-value', String(value)));
+    card.appendChild(el('span', 'stat-label', label));
+    if (note) card.appendChild(el('span', 'stat-note', note));
+    return card;
+  }
+
+  function rowsList(items, emptyText) {
+    if (!items.length) return el('div', 'panel-empty', emptyText);
+    const ul = el('ul', 'rows');
+    items.forEach((it) => {
+      const li = el('li');
+      if (it.badge) li.appendChild(it.badge);
+      const main = el('div', 'row-main');
+      main.appendChild(el('span', 'row-title', it.title));
+      if (it.sub) main.appendChild(el('span', 'row-sub', it.sub));
+      li.appendChild(main);
+      if (it.actions && it.actions.length) {
+        const a = el('div', 'row-actions');
+        it.actions.forEach((x) => a.appendChild(x));
+        li.appendChild(a);
+      }
+      ul.appendChild(li);
+    });
+    return ul;
+  }
+
+  let statsRefreshing = false;
+  /** Refresh folder snapshots in the background, then redraw the page once. */
+  function refreshStatsSoon() {
+    const stale = targets.some((t) => !targetStats.get(t.id) || Date.now() - targetStats.get(t.id).at > 15000);
+    if (!stale || statsRefreshing || !SUPPORTS_FOLDER_WRITE) return;
+    statsRefreshing = true;
+    refreshTargetStats().finally(() => {
+      statsRefreshing = false;
+      if (PAGE_VIEWS.has(state.view)) renderAll();
+    });
+  }
+
+  function countIn(kind) {
+    let known = false;
+    let n = 0;
+    for (const t of targets.filter((x) => x.kind === kind)) {
+      const st = targetStats.get(t.id);
+      if (st && st.state !== 'needs-permission') {
+        known = true;
+        n += st.skills.size;
+      }
+    }
+    return known ? n : '-';
+  }
+
+  function renderPage() {
+    const page = $('page');
+    page.textContent = '';
+    ({ home: renderHome, projects: renderProjects, updates: renderUpdates, security: renderSecurity, settings: renderSettings })[state.view](page);
+  }
+
+  function renderHome(page) {
+    refreshStatsSoon();
+    page.appendChild(pageHead('Home', 'Claude Code skills at a glance', 'Everything here is read from your library and the folders you connected.'));
+    const stats = el('div', 'stats');
+    stats.appendChild(statCard(library().length, 'Skills in library', `${bundled.length} bundled · ${github.length} GitHub · ${custom.length} yours`, () => goTo('all')));
+    stats.appendChild(statCard(connection === 'connected' ? installed.size : '-', 'Installed here', connection === 'connected' ? (currentTarget() || {}).label : 'Not connected', () => goTo('installed')));
+    stats.appendChild(statCard(countIn('personal'), 'Personal skills', 'In ~/.claude/skills, every project', () => goTo('projects')));
+    stats.appendChild(statCard(countIn('project'), 'Project skills', `${plural(targets.filter((t) => t.kind === 'project').length, 'project folder')}`, () => goTo('projects')));
+    stats.appendChild(statCard(updateCount(), 'Updates available', github.some((s) => s.updateCheck) ? 'Library and GitHub' : 'Library versions', () => goTo('updates')));
+    stats.appendChild(statCard(library().filter(needsReview).length, 'Need a security look', 'Library skills with findings', () => goTo('security')));
+    page.appendChild(stats);
+
+    const quick = panel('Quick actions');
+    const q = el('div', 'quick panel-body');
+    q.appendChild(button('Browse skills', '', () => goTo('all')));
+    q.appendChild(button('Import from GitHub', '', () => $('open-github').click()));
+    q.appendChild(button('Create a skill', '', () => openMaker(null)));
+    q.appendChild(button('Manage installations', '', () => goTo('installed')));
+    q.appendChild(button('Run a security scan', '', () => {
+      goTo('security');
+      if (connection === 'connected' && installed.size) rescanInstalled();
+    }));
+    if (DESKTOP && DESKTOP.openSkillsFolder) q.appendChild(button('Open skills folder', '', openSkillsFolder));
+    else if (SUPPORTS_FOLDER_WRITE && connection !== 'connected') q.appendChild(button('Connect skills folder', '', () => connectFolder(false)));
+    quick.appendChild(q);
+    page.appendChild(quick);
+
+    const cols = el('div', 'two-col');
+    const added = github.concat(custom).filter((s) => s.addedAt || s.updatedAt)
+      .sort((a, b) => Date.parse(b.updatedAt || b.addedAt) - Date.parse(a.updatedAt || a.addedAt)).slice(0, 6);
+    const recentAdded = panel('Recently added or edited');
+    recentAdded.appendChild(rowsList(added.map((s) => ({
+      title: s.name,
+      sub: `${s.source === 'github' ? `From ${s.origin}` : 'Made by you'} · ${timeAgo(s.updatedAt || s.addedAt)}`,
+      actions: [button('Details', 'btn-sm btn-ghost', () => openPreview(s.id))],
+    })), 'Skills you import or create show up here.'));
+    cols.appendChild(recentAdded);
+
+    const updatedInstalled = [...installed.entries()].sort((a, b) => (b[1].modified || 0) - (a[1].modified || 0) || a[0].localeCompare(b[0])).slice(0, 6);
+    const recentUpdated = panel('Recently updated in Claude Code');
+    recentUpdated.appendChild(rowsList(updatedInstalled.map(([dir, i]) => ({
+      title: i.name,
+      sub: `${dir} · ${i.modified ? `modified ${timeAgo(i.modified)}` : 'modified date unknown'}`,
+      actions: [button('Details', 'btn-sm btn-ghost', () => openPreview(byId.get(dir) ? dir : (library().find((s) => s.installDir === dir) || {}).id || `local:${dir}`))],
+    })), connection === 'connected' ? 'No installed skills yet.' : 'Connect to your skills folder to see installed skills.'));
+    cols.appendChild(recentUpdated);
+
+    const installs = history.filter((e) => e.action !== 'undo').slice(0, 6);
+    const recentInstalls = panel('Recent installations', [button('History', 'btn-sm btn-ghost', () => goTo('history'))]);
+    recentInstalls.appendChild(rowsList(installs.map((e) => ({
+      title: `${ACTION_LABEL[e.action] || e.action} ${e.skill}`,
+      sub: `${e.targetLabel || 'Claude Code'} · ${timeAgo(e.time)}${e.undone ? ' · undone' : ''}`,
+    })), 'Installs, updates and removals show up here.'));
+    cols.appendChild(recentInstalls);
+
+    const findings = activity.filter((a) => (a.type === 'scan' || a.type === 'import') && a.result !== 'ok').slice(0, 6);
+    const recentFindings = panel('Recent security findings', [button('Security', 'btn-sm btn-ghost', () => goTo('security'))]);
+    recentFindings.appendChild(rowsList(findings.map((a) => ({
+      badge: riskBadge('warning'),
+      title: `${ACTIVITY_LABEL[a.type]} ${a.skill}`,
+      sub: `${a.detail} · ${timeAgo(a.time)}`,
+    })), 'Imports and scans that found something to look at show up here.'));
+    cols.appendChild(recentFindings);
+    page.appendChild(cols);
+  }
+
+  function renderProjects(page) {
+    refreshStatsSoon();
+    page.appendChild(pageHead('Claude Code', 'Personal and project skills', 'Personal skills (~/.claude/skills) work in every project. Project skills (<project>/.claude/skills) only work in that project.'));
+    if (!SUPPORTS_FOLDER_WRITE) {
+      page.appendChild(notice('info', ICONS.info, 'Managing folders needs the desktop app, Microsoft Edge or Google Chrome.'));
+      return;
+    }
+    const list = panel('Folders', [button('Add a project folder', 'btn-primary btn-sm', addProjectTarget, 'add-project')]);
+    const personal = targets.find((t) => t.kind === 'personal');
+    const items = [];
+    if (!personal) {
+      items.push({ title: 'Personal skills folder', sub: 'Not connected', actions: [button('Connect', 'btn-sm', () => connectFolder(true))] });
+    }
+    for (const t of targets) {
+      const st = targetStats.get(t.id);
+      const isCurrent = t.id === currentTargetId;
+      const actions = [];
+      if (!st || st.state === 'needs-permission') actions.push(button('Allow access', 'btn-sm', async () => {
+        if (await ensureAccess(t)) {
+          targetStats.set(t.id, await readTargetSkills(t));
+          renderAll();
+        }
+      }));
+      actions.push(button('Show skills', 'btn-sm', async () => {
+        if (!isCurrent) await switchTarget(t.id);
+        goTo('installed');
+      }));
+      actions.push(button('History', 'btn-sm btn-ghost', () => {
+        state.historyFilter = { type: '', target: t.id };
+        goTo('history');
+      }));
+      if (t.kind === 'project') {
+        actions.push(button('Remove from list', 'btn-sm btn-ghost', async () => {
+          if (!isCurrent) await switchTarget(t.id);
+          await removeProjectTarget();
+        }));
+      }
+      const count = st && st.state !== 'needs-permission' ? plural(st.skills.size, 'skill') : 'access needed';
+      items.push({
+        badge: el('span', `pill ${t.kind === 'personal' ? 'pill-original' : ''}`, t.kind === 'personal' ? 'Personal' : 'Project'),
+        title: `${t.kind === 'project' ? t.handle.name : 'Personal skills'}${isCurrent ? ' (install target)' : ''}`,
+        sub: `${installPathOf(t, '').replace(/[\\/]$/, '')} · ${count}${st && st.state === 'error' ? ` · ${st.error}` : ''}`,
+        actions,
+      });
+    }
+    list.appendChild(rowsList(items, ''));
+    page.appendChild(list);
+
+    // Compare: which skill names live where, and which clash.
+    const known = targets.filter((t) => targetStats.get(t.id) && targetStats.get(t.id).state !== 'needs-permission');
+    if (known.length) {
+      const names = new Map();
+      for (const t of known) {
+        for (const [dir, info] of targetStats.get(t.id).skills) {
+          const key = info.name;
+          if (!names.has(key)) names.set(key, new Map());
+          names.get(key).set(t.id, dir);
+        }
+      }
+      const clashes = [...names.entries()].filter(([, where]) => where.size > 1);
+      const cmp = panel('Compare folders');
+      if (clashes.length) {
+        cmp.appendChild(notice('', ICONS.warn, `${plural(clashes.length, 'skill name')} ${clashes.length === 1 ? 'is' : 'are'} installed in more than one folder. Claude Code may use only one of them in a project, so check they are the version you expect.`));
+        cmp.lastChild.style.margin = '12px 14px 0';
+      }
+      const wrapTable = el('div');
+      wrapTable.style.overflowX = 'auto';
+      const table = el('table', 'compare-table');
+      const head = el('tr');
+      head.appendChild(el('th', null, 'Skill'));
+      known.forEach((t) => head.appendChild(el('th', null, t.kind === 'project' ? t.handle.name : 'Personal')));
+      table.appendChild(head);
+      [...names.entries()].sort((a, b) => (b[1].size - a[1].size) || a[0].localeCompare(b[0])).slice(0, 200).forEach(([name, where]) => {
+        const tr = el('tr');
+        const nameCell = el('td', null, name);
+        if (where.size > 1) {
+          const pill = el('span', 'pill pill-unverified', 'In several folders');
+          pill.style.marginLeft = '8px';
+          nameCell.appendChild(pill);
+        }
+        tr.appendChild(nameCell);
+        known.forEach((t) => tr.appendChild(el('td', where.has(t.id) ? 'yes' : 'no', where.has(t.id) ? '✓' : '–')));
+        table.appendChild(tr);
+      });
+      wrapTable.appendChild(table);
+      cmp.appendChild(wrapTable);
+      if (names.size > 200) cmp.appendChild(el('div', 'panel-empty', `Showing 200 of ${names.size} skills.`));
+      if (!names.size) cmp.appendChild(el('div', 'panel-empty', 'No skills installed in these folders yet.'));
+      page.appendChild(cmp);
+    }
+  }
+
+  function renderUpdates(page) {
+    page.appendChild(pageHead('Claude Code', 'Updates', 'Updates are only shown when versions really differ: library and installed copies are compared file by file, and GitHub imports by commit.'));
+    const lib = panel('Library versions newer than installed copies', connection === 'connected' && updatable().length
+      ? [button(`Update all (${updatable().length})`, 'btn-primary btn-sm', () => installSkills(updatable(), false), 'updates-all')]
+      : []);
+    if (connection !== 'connected') {
+      lib.appendChild(el('div', 'panel-empty', 'Connect to a skills folder to compare installed copies with the library.'));
+    } else {
+      lib.appendChild(rowsList(updatable().map((s) => ({
+        title: s.name,
+        sub: `${installPathOf(currentTarget(), s.installDir)}${installed.get(s.installDir) ? ` · installed copy modified ${formatDate(installed.get(s.installDir).modified)}` : ''}`,
+        actions: [button('Compare', 'btn-sm', () => compareInstalled(s)), button('Update', 'btn-sm btn-primary', () => installSkills([s], false))],
+      })), `Everything installed in ${(currentTarget() || {}).label} matches the library.`));
+    }
+    page.appendChild(lib);
+
+    const checkBtn = button(ghCheck && ghCheck.running ? 'Checking...' : 'Check GitHub for updates', 'btn-sm', checkGitHubUpdates, 'gh-check');
+    checkBtn.disabled = !github.length || Boolean(ghCheck && ghCheck.running);
+    const gh = panel('Skills imported from GitHub', [checkBtn]);
+    if (ghCheck && ghCheck.error) {
+      gh.appendChild(notice('danger', ICONS.warn, `The check stopped: ${ghCheck.error}`));
+      gh.lastChild.style.margin = '12px 14px 0';
+    }
+    gh.appendChild(rowsList(github.map((s) => {
+      const c = s.updateCheck;
+      let sub = `${s.origin} at ${s.commit}`;
+      let badge = null;
+      if (c) {
+        if (c.changed === true) {
+          badge = el('span', 'pill pill-info', 'Update available');
+          sub += ` → ${c.latest.slice(0, 7)} (${plural(c.files.length, 'file')} changed in this skill)`;
+        } else if (c.changed === null) {
+          badge = el('span', 'pill', 'Unknown');
+          sub += ' · too many changes in the repository to tell; review to be sure';
+        } else sub += ` · up to date (checked ${timeAgo(c.checkedAt)})`;
+      } else sub += ' · not checked yet';
+      const actions = [];
+      if (c && c.changed !== false) actions.push(button('Review update', 'btn-sm btn-primary', () => reviewGitHubUpdate(s)));
+      if (s.previous) actions.push(button(`Restore ${s.previous.commit}`, 'btn-sm btn-ghost', () => restorePrevious(s)));
+      actions.push(button('Details', 'btn-sm btn-ghost', () => openPreview(s.id)));
+      return { badge, title: s.name, sub, actions };
+    }), 'No GitHub skills in your library. Import some with "Add from GitHub".'));
+    if (github.length) gh.appendChild(el('div', 'panel-empty', 'Checking uses a few GitHub lookups per repository (GitHub allows 60 an hour without signing in). Each update is downloaded, scanned and shown to you before anything changes.'));
+    page.appendChild(gh);
+
+    if (watched.length) {
+      const w = panel('Watched repositories', [button('Manage', 'btn-sm btn-ghost', () => $('open-github').click())]);
+      w.appendChild(rowsList(watched.map((x) => ({
+        title: x.label,
+        sub: x.changed ? 'New commits since your last scan' : `No new commits (checked ${timeAgo(x.checkedAt)})`,
+        actions: [button('Scan now', 'btn-sm', () => scanLink(x.link))],
+      })), ''));
+      page.appendChild(w);
+    }
+  }
+
+  function renderSecurity(page) {
+    page.appendChild(pageHead('Insights', 'Security', 'Every skill is scanned on this computer before it can be installed. These results come from that scan; nothing is sent anywhere.'));
+    const levels = { critical: 0, high: 0, warning: 0, info: 0, clean: 0 };
+    const lib = library();
+    lib.forEach((s) => levels[reportOf(s).level]++);
+    const stats = el('div', 'stats');
+    stats.appendChild(statCard(lib.length, 'Library skills scanned'));
+    stats.appendChild(statCard(levels.clean + levels.info, 'No risky patterns'));
+    stats.appendChild(statCard(levels.warning, 'Warnings to review', 'Notes, or parts that could not be checked', () => {
+      state.filters.status = 'review';
+      $('filter-status').value = 'review';
+      goTo('all');
+    }));
+    stats.appendChild(statCard(levels.high + levels.critical, 'High or critical', 'Blocked from install unless reviewed'));
+    stats.appendChild(statCard(connection === 'connected' && rescanTarget === currentTargetId ? rescan.size : '-', 'Installed skills re-scanned', connection === 'connected' ? (currentTarget() || {}).label : 'Not connected'));
+    page.appendChild(stats);
+
+    const scanBtn = button('Scan installed skills', 'btn-primary btn-sm', rescanInstalled, 'scan-installed');
+    scanBtn.disabled = !(connection === 'connected' && installed.size) || busy;
+    const inst = panel(`Installed in ${(currentTarget() || {}).label || 'Claude Code'}`, [scanBtn]);
+    if (connection !== 'connected') inst.appendChild(el('div', 'panel-empty', 'Connect to a skills folder to scan what is installed.'));
+    else if (rescanTarget !== currentTargetId || !rescan.size) inst.appendChild(el('div', 'panel-empty', `Not scanned yet in this session. ${plural(installed.size, 'skill')} installed.`));
+    else {
+      inst.appendChild(rowsList([...rescan.entries()]
+        .map(([dir, r]) => ({ dir, r, level: Scan.summarizeFindings(r.findings).level }))
+        .sort((a, b) => ['critical', 'high', 'warning', 'info', 'clean'].indexOf(a.level) - ['critical', 'high', 'warning', 'info', 'clean'].indexOf(b.level))
+        .map(({ dir, r, level }) => ({
+          badge: riskBadge(level),
+          title: dir,
+          sub: `${LEVEL_TEXT[level]} · scanned ${timeAgo(r.checkedAt)}`,
+          actions: [button('Report', 'btn-sm btn-ghost', () => {
+            const s = library().find((x) => x.installDir === dir && installState(x)) || byId.get(`local:${dir}`);
+            if (s) openPreview(s.id, 'security');
+          })],
+        })), ''));
+    }
+    page.appendChild(inst);
+
+    const review = lib.filter(needsReview).sort((a, b) => ['critical', 'high', 'warning'].indexOf(reportOf(a).level) - ['critical', 'high', 'warning'].indexOf(reportOf(b).level));
+    const flagged = panel('Library skills with findings');
+    flagged.appendChild(rowsList(review.slice(0, 50).map((s) => ({
+      badge: riskBadge(reportOf(s).level),
+      title: s.name,
+      sub: reportOf(s).findings.filter((f) => f.risk !== 'info').slice(0, 2).map((f) => `${f.title} (${f.file}${f.line ? `:${f.line}` : ''})`).join(' · '),
+      actions: [button('Report', 'btn-sm btn-ghost', () => openPreview(s.id, 'security'))],
+    })), 'No library skill has findings beyond informational notes.'));
+    page.appendChild(flagged);
+
+    const recent = panel('Recent scans and imports');
+    recent.appendChild(rowsList(activity.filter((a) => a.type === 'scan' || a.type === 'import').slice(0, 10).map((a) => ({
+      badge: riskBadge(a.result === 'ok' ? 'clean' : 'warning'),
+      title: `${ACTIVITY_LABEL[a.type]} ${a.skill}`,
+      sub: `${a.detail} · ${timeAgo(a.time)}`,
+    })), 'Scans and GitHub imports show up here.'));
+    page.appendChild(recent);
+
+    const rules = panel('What the scanner looks for');
+    const body = el('div', 'panel-body');
+    const kinds = [['threat', 'Detected threats (block install)'], ['suspicious', 'Suspicious patterns (worth a look)'], ['unverified', "Couldn't be checked"], ['compat', 'Compatibility'], ['info', 'Informational']];
+    for (const [kind, label] of kinds) {
+      const titles = [...new Set(Object.values(Scan.RULE_INFO).filter((r) => r.kind === kind).map((r) => r.title))];
+      if (!titles.length) continue;
+      body.appendChild(el('p', 'section-label', label));
+      const ul = el('ul', 'steps');
+      ul.style.margin = '0 0 12px';
+      titles.forEach((t) => ul.appendChild(el('li', null, t)));
+      body.appendChild(ul);
+    }
+    body.appendChild(el('p', 'report-note', 'Patterns are matched in every file, including look-alike letters and hidden characters. In documentation, most patterns are reported as notes, because instructions for a person are not run by the skill. A clean result is not a guarantee of safety.'));
+    rules.appendChild(body);
+    page.appendChild(rules);
+  }
+
+  function settingRow(title, sub, control) {
+    const row = el('div', 'settings-row');
+    const main = el('div', 'row-main');
+    main.appendChild(el('div', 'row-title', title));
+    if (sub) main.appendChild(el('div', 'row-sub', sub));
+    row.appendChild(main);
+    row.appendChild(control);
+    return row;
+  }
+
+  function toggleControl(id, checked, label, onChange) {
+    const wrap = el('label', 'switch');
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.id = id;
+    input.checked = checked;
+    input.setAttribute('aria-label', label);
+    input.dataset.focusKey = id;
+    input.addEventListener('change', () => onChange(input.checked));
+    wrap.appendChild(input);
+    wrap.appendChild(el('span'));
+    return wrap;
+  }
+
+  function selectControl(id, label, options, value, onChange) {
+    const select = document.createElement('select');
+    select.className = 'select';
+    select.id = id;
+    select.dataset.focusKey = id;
+    select.setAttribute('aria-label', label);
+    for (const [v, text] of options) {
+      const o = document.createElement('option');
+      o.value = v;
+      o.textContent = text;
+      o.selected = String(v) === String(value);
+      select.appendChild(o);
+    }
+    select.addEventListener('change', () => onChange(select.value));
+    return select;
+  }
+
+  function updateSetting(key, value) {
+    settings[key] = value;
+    saveSettings();
+    renderAll();
+  }
+
+  function renderSettings(page) {
+    page.appendChild(pageHead('Prabh’s CSC', 'Settings', 'Saved on this computer.'));
+
+    const look = panel('Appearance');
+    look.appendChild(settingRow('Theme', 'Follow Windows, or always light or dark.', selectControl('set-theme', 'Theme', [['system', 'Match system'], ['light', 'Light'], ['dark', 'Dark']], storedTheme() || 'system', (v) => setTheme(v))));
+    look.appendChild(settingRow('Start page', 'What the app shows when it opens.', selectControl('set-start', 'Start page', [['home', 'Home'], ['all', 'All skills'], ['installed', 'Installed']], settings.startView, (v) => updateSetting('startView', v))));
+    page.appendChild(look);
+
+    const inst = panel('Installing');
+    if (SUPPORTS_FOLDER_WRITE) {
+      const options = [['', 'Last used folder']].concat(targets.map((t) => [t.id, t.label]));
+      inst.appendChild(settingRow('Default install location', 'The folder selected when the app opens.', selectControl('set-default-target', 'Default install location', options, settings.defaultTargetId, (v) => updateSetting('defaultTargetId', v))));
+      const personal = targets.find((t) => t.kind === 'personal');
+      inst.appendChild(settingRow('Personal skills folder', personal ? `Connected: ${installPathOf(personal, '').replace(/[\\/]$/, '')}` : 'Not connected yet.', button(personal ? 'Choose again' : 'Connect', 'btn-sm', () => connectFolder(true))));
+      if (DESKTOP && DESKTOP.openSkillsFolder) inst.appendChild(settingRow('Open the skills folder', 'Opens ~/.claude/skills in File Explorer.', button('Open', 'btn-sm', openSkillsFolder)));
+    }
+    inst.appendChild(settingRow('Ask before removing a skill', 'Removals are always backed up and can be undone, so you can turn this off. Updates always ask first.', toggleControl('set-confirm-remove', settings.confirmRemove, 'Ask before removing a skill', (v) => updateSetting('confirmRemove', v))));
+    page.appendChild(inst);
+
+    const backups = panel('Backups and history');
+    backups.appendChild(settingRow('Keep backups for', 'How many recent install, update or removal batches can be undone. Older entries stay listed without a backup.', selectControl('set-backups', 'Keep backups for', [[3, 'Last 3 changes'], [5, 'Last 5 changes'], [10, 'Last 10 changes']], settings.backupsKept, (v) => {
+      settings.backupsKept = Number(v);
+      saveSettings();
+    })));
+    const stored = history.filter((e) => e.undo && e.undo.files).reduce((n, e) => n + e.undo.files.reduce((m, f) => m + f.bytes.length, 0), 0);
+    const entryCount = history.filter((e) => e.action !== 'undo').length + activity.length;
+    backups.appendChild(settingRow('Clear history', `${entryCount} ${entryCount === 1 ? 'entry' : 'entries'}, ${formatBytes(stored)} of backups. Installed skills are not touched.`, button('Clear', 'btn-sm btn-danger-ghost', async () => {
+      const ok = await confirmDialog('Clear all history and backups?', ['Past changes can no longer be undone. Installed skills stay exactly as they are.'], 'Clear history', null, true);
+      if (!ok) return;
+      history = [];
+      activity = [];
+      saveHistory();
+      saveActivity();
+      lastInstall = null;
+      renderAll();
+      showToast('History cleared.', 2500);
+    })));
+    page.appendChild(backups);
+
+    const sec = panel('Security');
+    sec.appendChild(settingRow('Allow skills that couldn\'t be fully checked', 'For example skills with programs, archives or very large files. When on, you are always asked first. Skills detected as dangerous can never be installed.', toggleControl('set-allow-unverified', settings.allowUnverified, 'Allow skills that could not be fully checked', (v) => updateSetting('allowUnverified', v))));
+    page.appendChild(sec);
+
+    const gh = panel('GitHub');
+    gh.appendChild(settingRow('Check watched repositories automatically', 'When the app opens and every hour while it is open. Uses GitHub lookups without signing in.', toggleControl('set-auto-watch', settings.autoCheckWatched, 'Check watched repositories automatically', (v) => updateSetting('autoCheckWatched', v))));
+    gh.appendChild(settingRow('Watched repositories', `${watched.length} ${watched.length === 1 ? 'repository' : 'repositories'}`, button('Manage', 'btn-sm', () => $('open-github').click())));
+    page.appendChild(gh);
+
+    const about = panel('About');
+    const links = el('div', 'row-actions');
+    const link = (label, href) => {
+      const a = el('a', 'btn btn-sm', label);
+      a.href = href;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      links.appendChild(a);
+    };
+    const home = APP_INFO.homepage || 'https://github.com/tufflerp/Prabh-s-CSC';
+    link('GitHub repository', home);
+    link('Documentation', `${home}#readme`);
+    link('Report a security issue', `${home}/security`);
+    about.appendChild(settingRow(`Prabh’s CSC ${APP_INFO.version ? `version ${APP_INFO.version}` : ''}`.trim(), `${DESKTOP ? 'Desktop app' : HOSTED ? 'Web version' : 'Browser version'} · ${bundled.length} bundled skills · open source (MIT). No accounts, no tracking: everything stays on this computer.`, links));
+    page.appendChild(about);
+  }
+
+  function openSkillsFolder() {
+    if (!DESKTOP || !DESKTOP.openSkillsFolder) return;
+    DESKTOP.openSkillsFolder().then((result) => {
+      if (result && result.error) showToast(`Couldn't open the folder: ${result.error}`, 5000);
+    }, (err) => showToast(`Couldn't open the folder: ${err.message}`, 5000));
   }
 
   // ------------------------------------------------------------------ theme
@@ -2507,14 +4312,23 @@
     });
   }
 
-  $('theme-toggle').addEventListener('click', () => {
-    const next = currentTheme() === 'dark' ? 'light' : 'dark';
-    applyTheme(next);
+  /** 'system' follows Windows; 'light' or 'dark' is remembered (boot.js applies it before first paint). */
+  function setTheme(choice) {
     try {
-      localStorage.setItem('skill-connector-theme', next);
+      if (choice === 'system') localStorage.removeItem('skill-connector-theme');
+      else localStorage.setItem('skill-connector-theme', choice);
     } catch {
       /* storage unavailable */
     }
+    if (choice === 'system') {
+      document.documentElement.removeAttribute('data-theme');
+      $('theme-label').textContent = currentTheme() === 'dark' ? 'Light mode' : 'Dark mode';
+    } else applyTheme(choice);
+  }
+
+  $('theme-toggle').addEventListener('click', () => {
+    setTheme(currentTheme() === 'dark' ? 'light' : 'dark');
+    if (state.view === 'settings') renderAll();
   });
 
   // ----------------------------------------------------------------- events
@@ -2538,11 +4352,22 @@
   });
 
   document.querySelectorAll('.nav-item[data-view]').forEach((item) => {
-    item.addEventListener('click', () => {
-      state.view = item.getAttribute('data-view');
-      renderAll();
-    });
+    item.addEventListener('click', () => goTo(item.getAttribute('data-view')));
   });
+
+  $('filter-category').addEventListener('change', () => {
+    state.filters.category = $('filter-category').value;
+    keepFocus(renderGrid);
+  });
+  $('filter-status').addEventListener('change', () => {
+    state.filters.status = $('filter-status').value;
+    keepFocus(renderGrid);
+  });
+  $('sort').addEventListener('change', () => {
+    state.filters.sort = $('sort').value;
+    keepFocus(renderGrid);
+  });
+  $('clear-filters').addEventListener('click', clearFilters);
 
   const tabs = [...document.querySelectorAll('.segmented [role="tab"]')];
   function selectTab(tab, focus) {
@@ -2605,8 +4430,40 @@
     if (e.target === preview && pressedOnBackdrop) preview.close();
   });
   preview.addEventListener('close', () => {
+    previewToken++; // ignore file loads that finish after closing
     const opener = document.querySelector(`[data-focus-key="${CSS.escape(`card:${previewId}`)}"]`);
     if (opener) opener.focus({ preventScroll: true });
+  });
+  const previewTabs = [...document.querySelectorAll('#preview-tabs [role="tab"]')];
+  previewTabs.forEach((tab, i) => {
+    tab.addEventListener('click', () => selectPreviewTab(tab.dataset.tab));
+    tab.addEventListener('keydown', (e) => {
+      const step = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
+      if (!step) return;
+      e.preventDefault();
+      const next = previewTabs[(i + step + previewTabs.length) % previewTabs.length];
+      selectPreviewTab(next.dataset.tab);
+      next.focus();
+    });
+  });
+  $('preview-md-toggle').addEventListener('click', () => {
+    previewRaw = !previewRaw;
+    renderPreviewSkillMd();
+  });
+  $('preview-md-copy').addEventListener('click', () => copyText($('preview-body').textContent));
+  $('preview-copy-edit').addEventListener('click', () => {
+    if (previewSkill) openMaker(previewSkill, true);
+  });
+
+  $('compare-close').addEventListener('click', () => $('compare').close());
+  $('compare-cancel').addEventListener('click', () => $('compare').close());
+  $('compare-apply').addEventListener('click', async () => {
+    if (!compareApply) return;
+    $('compare-apply').disabled = true;
+    const apply = compareApply;
+    compareApply = null;
+    if ($('compare').open) $('compare').close();
+    await apply();
   });
 
   $('open-github').addEventListener('click', () => {
@@ -2624,6 +4481,22 @@
   });
   $('open-maker').addEventListener('click', () => openMaker(null));
   ['maker-name', 'maker-description', 'maker-body'].forEach((id) => $(id).addEventListener('input', updateMaker));
+  $('maker-file-text').addEventListener('input', () => {
+    const file = makerFiles.find((f) => f.path === makerCurrent);
+    if (!file) return;
+    file.bytes = encoder.encode($('maker-file-text').value);
+    renderMakerFiles();
+    updateMaker();
+  });
+  document.querySelectorAll('[data-maker-tab]').forEach((b) => b.addEventListener('click', () => {
+    makerView = b.dataset.makerTab;
+    renderMakerView();
+  }));
+  $('maker-add-file').addEventListener('click', makerAddFile);
+  $('maker-add-folder').addEventListener('click', makerAddFolder);
+  $('maker-rename-file').addEventListener('click', makerRenameFile);
+  $('maker-delete-file').addEventListener('click', makerDeleteFile);
+  $('maker-export').addEventListener('click', exportMaker);
   $('maker-form').addEventListener('submit', (e) => {
     e.preventDefault();
     saveMaker();
@@ -2696,27 +4569,41 @@
 
   reindex();
   renderChips();
+  renderCategoryFilter();
   renderAll();
-  // Saved skills load before the first look at the skills folder, so they are recognised as installed.
-  const ready = Promise.all([
-    SUPPORTS_FOLDER_WRITE ? loadTargets() : null,
-    idbGet('history'),
-    loadCustom(),
-    HOSTED ? null : loadGithub(),
-  ]).then(([, savedHistory, savedCustom, savedGithub]) => {
+  // Settings first (start page, default folder); saved skills load before the first look
+  // at the skills folder, so they are recognised as installed.
+  const ready = idbGet('settings').then((saved) => {
+    if (saved && typeof saved === 'object') settings = { ...DEFAULT_SETTINGS, ...saved };
+    if (state.view === 'home' && settings.startView !== 'home') state.view = settings.startView;
+    return Promise.all([
+      SUPPORTS_FOLDER_WRITE ? loadTargets() : null,
+      idbGet('history'),
+      idbGet('activity'),
+      loadCustom(),
+      HOSTED ? null : loadGithub(),
+    ]);
+  }).then(([, savedHistory, savedActivity, savedCustom, savedGithub]) => {
     if (Array.isArray(savedHistory)) history = savedHistory;
+    if (Array.isArray(savedActivity)) activity = savedActivity;
     if (Array.isArray(savedCustom)) custom = savedCustom.filter((s) => s && s.source === 'custom');
     if (Array.isArray(savedGithub)) github = savedGithub.filter((s) => s && s.source === 'github' && !NOT_INSTALLABLE.has(s.status));
+    if (settings.defaultTargetId && targets.some((t) => t.id === settings.defaultTargetId)) currentTargetId = settings.defaultTargetId;
     reindex();
+    renderCategoryFilter();
     return refreshInstalled();
   }).then(renderAll);
   if (!HOSTED) {
-    idbGet('watched-repos').then((saved) => {
+    idbGet('watched-repos').then(async (saved) => {
       if (Array.isArray(saved)) watched = saved;
       renderWatchNotice();
-      return checkWatched(false);
+      await ready;
+      return settings.autoCheckWatched ? checkWatched(false) : false;
     });
-    setInterval(() => checkWatched(false), WATCH_INTERVAL); // while the app stays open
+    // While the app stays open.
+    setInterval(() => {
+      if (settings.autoCheckWatched) checkWatched(false);
+    }, WATCH_INTERVAL);
   }
 
   /**

@@ -55,6 +55,11 @@ async function main() {
 
     console.log('Locked down');
     check(await page.evaluate(() => typeof window.require === 'undefined' && typeof window.process === 'undefined'), 'page has no Node access');
+    const bridge = await page.evaluate(() => Object.keys(window.cscDesktop || {}).sort());
+    check(JSON.stringify(bridge) === JSON.stringify(['openSkillsFolder', 'version']), `desktop bridge offers only its two calls (${bridge.join(', ')})`);
+    const version = await page.evaluate(() => window.cscDesktop.version());
+    check(version === require(path.join(ROOT, 'package.json')).version, `bridge reports the app version (${version})`);
+    check(await page.evaluate(() => Boolean(document.querySelector('[data-view="home"]'))), 'opens the redesigned app');
     const blocked = await page.evaluate(() => fetch('https://example.com/').then(() => false, () => true));
     check(blocked, 'requests to other sites are blocked');
     // Record links instead of opening the real browser.
