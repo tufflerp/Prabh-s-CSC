@@ -51,7 +51,9 @@ function main() {
 
   const skills = buildSkillIndex(SKILLS_DIR);
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(path.join(DATA_DIR, 'skills-data.js'), `window.SKILLS = ${JSON.stringify(skills)};\n`, 'utf8');
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+  const appInfo = { version: pkg.version, homepage: (pkg.homepage || '').replace(/#readme$/, '') };
+  fs.writeFileSync(path.join(DATA_DIR, 'skills-data.js'), `window.SKILLS = ${JSON.stringify(skills)};\nwindow.CSC_APP = ${JSON.stringify(appInfo)};\n`, 'utf8');
   fs.copyFileSync(path.join(__dirname, 'lib', 'skill-scan-core.js'), path.join(DATA_DIR, 'scan-core.js'));
   fs.copyFileSync(path.join(__dirname, 'lib', 'zip-store.js'), path.join(DATA_DIR, 'zip-store.js'));
   const allowlist = loadAllowlist(path.join(ROOT, 'config', 'skill-scan-allowlist.json'))

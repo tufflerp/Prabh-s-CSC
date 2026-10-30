@@ -16,7 +16,7 @@
     "installer": "npm run build && electron-builder --win --publish never",
     "artifact": "node scripts/skill-connector-artifact.js",
     "claude-e2e": "node scripts/skill-connector-claude-e2e.js",
-    "test": "node tests/ci/skill-connector-app.test.js"
+    "test": "node tests/ci/skill-connector-app.test.js && node tests/ci/skill-scan-core.test.js"
   },
   "build": {
     "appId": "com.tufflerp.prabhs-csc",

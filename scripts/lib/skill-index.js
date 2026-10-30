@@ -2,7 +2,8 @@
 
 const fs = require('fs');
 const path = require('path');
-const { parseFrontmatter, checkClaudeCompat, skillFingerprint, IGNORED_DIR_NAMES } = require('./skill-scan-core');
+const { parseFrontmatter, checkClaudeCompat, skillFingerprint, categorize, IGNORED_DIR_NAMES } = require('./skill-scan-core');
+const { scanSkill, applyAllowlist, loadAllowlist } = require('./skill-scan');
 
 /**
  * Every file of a skill as { path, full, size }, sorted, skipping caches and
@@ -54,12 +55,16 @@ function loadTryPrompts(skillsDir) {
  * version fingerprint (skillFingerprint) used to spot updates; `tryPrompt` is
  * an example request (config/try-prompts.json, scripts/generate-try-prompts.js).
  *
- * @returns {Array<{ name: string, dir: string, installDir: string, original: boolean, tryPrompt: string, fp: string, description: string, body: string }>}
+ * Each skill also carries its `categories` (from its name and description) and the
+ * `findings` of the safety scan, with reviewed exceptions marked `allowed`.
+ *
+ * @returns {Array<{ name: string, dir: string, installDir: string, original: boolean, tryPrompt: string, fp: string, description: string, body: string, categories: string[], findings: object[] }>}
  */
 function buildSkillIndex(skillsDir) {
   const skills = [];
   const originals = loadOriginals(skillsDir);
   const tryPrompts = loadTryPrompts(skillsDir);
+  const allowlist = loadAllowlist(path.join(skillsDir, '..', 'config', 'skill-scan-allowlist.json'));
 
   for (const entry of fs.readdirSync(skillsDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
@@ -70,6 +75,8 @@ function buildSkillIndex(skillsDir) {
     const text = fs.readFileSync(file, 'utf8');
     const { attributes, body } = parseFrontmatter(text);
     const name = attributes.name || entry.name;
+    const skillDir = path.join(skillsDir, entry.name);
+    const scanned = applyAllowlist(scanSkill(skillDir, { ignoreCaches: true }), skillDir, allowlist);
     skills.push({
       name,
       dir: entry.name,
@@ -79,6 +86,8 @@ function buildSkillIndex(skillsDir) {
       fp: skillFingerprint(text, listSkillFiles(path.join(skillsDir, entry.name))),
       description: attributes.description || '',
       body,
+      categories: categorize(name, attributes.description || ''),
+      findings: scanned.findings.map((f) => ({ severity: f.severity, rule: f.rule, file: f.file.split(path.sep).join('/'), line: f.line, message: f.message })),
     });
   }
 

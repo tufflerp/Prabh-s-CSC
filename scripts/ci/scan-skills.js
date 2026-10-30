@@ -62,6 +62,8 @@ function main() {
       } else if (f.severity === 'allowed') {
         allowed++;
         if (options.verbose) console.log(`ALLOWED: ${where} [${f.rule}] ${f.reason}`);
+      } else if (f.severity === 'info') {
+        if (options.verbose) console.log(`INFO: ${where} [${f.rule}] ${f.message}`);
       } else {
         warnings++;
         if (options.verbose) console.log(`WARN: ${where} [${f.rule}] ${f.message}`);

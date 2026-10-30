@@ -79,6 +79,7 @@
    *   code  - blocks in scripts and other files; a note in documentation,
    *           except in SKILL.md when `skillMd: 'block'` (Claude follows SKILL.md)
    *   mild  - always a note: common in legitimate setup scripts
+   *   info  - informational only (`codeOnly`: skipped in documentation)
    */
   const RULES = [
     {
@@ -112,7 +113,20 @@
       scope: 'code',
       skillMd: 'block',
       message: 'Reads passwords, keys or other credentials',
-      pattern: new RegExp(String.raw`(?:\bcat\b|\btype\b|Get-Content|\bgc\b|open\s*\(|read_text|read_bytes|readFile(?:Sync)?|\bscp\b|\bcp\b|\bless\b|\bhead\b|\btail\b|\bbase64\b|\bxxd\b|Copy-Item|fs\.read)[^\n]{0,120}${CRED}|${CRED}[^\n]{0,60}(?:\.read_text|\.read_bytes|\.read\(\))|security\s+(?:find-generic-password|find-internet-password|dump-keychain)`, 'i'),
+      pattern: new RegExp(String.raw`(?:\bcat\b|\btype\b|Get-Content|\bgc\b|open\s*\(|read_text|read_bytes|readFile(?:Sync)?|\bscp\b|\bcp\b|\bless\b|\bhead\b|\btail\b|\bbase64\b|\bxxd\b|Copy-Item|fs\.read)[^\n]{0,120}${CRED}|${CRED}[^\n]{0,60}(?:\.read_text|\.read_bytes|\.read\(\))|security\s+(?:find-generic-password|find-internet-password|dump-keychain)|\bcmdkey(?:\.exe)?\s+\/list\b|\bvaultcmd(?:\.exe)?\s+\/list|\bGet-StoredCredential\b|\bCryptUnprotectData\b`, 'i'),
+    },
+    {
+      id: 'lolbin-exec',
+      scope: 'code',
+      skillMd: 'block',
+      message: 'Uses a built-in Windows tool to download or run code',
+      pattern: /\bcertutil(?:\.exe)?\s+[^\n]*-(?:urlcache|decode)\b|\bbitsadmin(?:\.exe)?\s+[^\n]*\/transfer\b|\bmshta(?:\.exe)?\s+["']?(?:https?:|vbscript:|javascript:)|\bregsvr32(?:\.exe)?\s+[^\n]*\/i:\s*["']?https?:|\brundll32(?:\.exe)?\s+[^\n]*javascript:/i,
+    },
+    {
+      id: 'obfuscated-code',
+      scope: 'code',
+      message: 'Builds commands from character codes or escapes to hide what they do',
+      pattern: /String\.fromCharCode\(\s*\d+(?:\s*,\s*\d+){15,}\s*\)|(?:\\x[0-9a-fA-F]{2}){24,}|\bchr\(\s*\d+\s*\)(?:\s*\+\s*chr\(\s*\d+\s*\)){9,}|\[char\[\]\]\s*\(\s*\d+(?:\s*,\s*\d+){15,}/,
     },
     {
       id: 'browser-credential-access',
@@ -177,6 +191,25 @@
       scope: 'mild',
       message: 'Sets up services, schedules or credentials (common in setup scripts; check it is expected)',
       pattern: /systemctl\s+enable|crontab\s+-e\b|history\s+-c\b|\.npmrc\b|\.kube\/config\b|\.docker\/config\.json|hooks\.slack\.com\/services|api\.telegram\.org\/bot/i,
+    },
+    {
+      id: 'env-harvesting',
+      scope: 'mild',
+      message: 'Saves every environment variable, which often include secrets',
+      pattern: /\b(?:printenv|env)\s*>{1,2}\s*["']?[\w~$./\\-]|\bjson\.dumps?\(\s*(?:dict\(\s*)?os\.environ\b|\b(?:Get-ChildItem|gci|ls|dir)\s+(?:-Path\s+)?env:\\?[^\n]*\|\s*(?:ConvertTo-Json|Out-File|Export-Csv|Set-Content)/i,
+    },
+    {
+      id: 'raw-ip-endpoint',
+      scope: 'mild',
+      message: 'Connects to a raw IP address instead of a named website',
+      pattern: /\b(?:https?|wss?|ftp):\/\/(?!(?:127|10|0)\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.0\.2\.|198\.51\.100\.|203\.0\.113\.)(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b/i,
+    },
+    {
+      id: 'network-access',
+      scope: 'info',
+      codeOnly: true,
+      message: 'Makes network requests',
+      pattern: NETWORK_SEND,
     },
     {
       id: 'prompt-injection',
@@ -407,11 +440,13 @@
     const severityFor = (rule) => {
       if (rule.scope === 'all') return 'block';
       if (rule.scope === 'mild') return 'warn';
+      if (rule.scope === 'info') return 'info';
       if (!docs) return 'block';
       return skillMd && rule.skillMd === 'block' ? 'block' : 'warn';
     };
 
     for (const rule of RULES) {
+      if (rule.codeOnly && docs) continue;
       const match = rule.pattern.exec(subject);
       if (!match || (rule.allow && rule.allow(match[0]))) continue;
       findings.push({ severity: severityFor(rule), rule: rule.id, file: relPath, line: lineOf(text, match.index), message: rule.message });
@@ -444,6 +479,124 @@
     }
 
     return findings;
+  }
+
+  // -------------------------------------------------------------- categories
+
+  /**
+   * Library categories, assigned only when the skill's own name or description
+   * uses one of the category's words. A skill can be in several, or none.
+   */
+  const CATEGORIES = [
+    ['Frontend', /\b(?:front-?end|react|next\.?js|vue|svelte|angular|tailwind|css|html|web ?ui|ui components?|dom|browser extensions?|accessibility|a11y)\b/],
+    ['Backend', /\b(?:back-?end|server-side|rest(?:ful)? apis?|graphql|grpc|databases?|sql|postgres(?:ql)?|mysql|sqlite|mongodb|redis|django|flask|fastapi|express(?:\.js)?|spring boot|laravel|rails|microservices?|orm)\b/],
+    ['Debugging', /\b(?:debug(?:ging|ger)?|bugs?|troubleshoot(?:ing)?|root cause|stack traces?|crash(?:es)?|diagnos(?:e|is|ing))\b/],
+    ['Testing', /\b(?:tests?|testing|tdd|unit tests?|e2e|end-to-end|integration tests?|playwright|jest|vitest|pytest|cypress|test coverage|qa)\b/],
+    ['Security', /\b(?:security|secure|vulnerabilit(?:y|ies)|owasp|threat model(?:ing)?|pen(?:etration)? ?test(?:ing)?|authentication|authorization|secrets?|encryption|xss|csrf|cve)\b/],
+    ['DevOps', /\b(?:devops|docker|containers?|kubernetes|k8s|helm|terraform|ansible|ci\/cd|ci|cd|pipelines?|deploy(?:ment|ments|ing)?|github actions|infrastructure|aws|azure|gcp|cloud|monitoring|observability|homelab|nginx|linux servers?)\b/],
+    ['Design', /\b(?:ui design|ux|user experience|user interfaces?|visual design|graphic design|figma|typography|colou?r palettes?|branding|brand guidelines|illustrations?|icons?|design systems?|mockups?|wireframes?|animations?|canvas|artwork)\b/],
+    ['Documentation', /\b(?:documentation|docs|readme|technical writing|changelogs?|api reference|docstrings?|write-?ups?)\b/],
+    ['Productivity', /\b(?:productivity|time management|note-?taking|to-?do lists?|emails?|calendars?|meetings?|checklists?|task management|brainstorm(?:s|ing)?|scheduling|spreadsheets?|slide decks?|presentations?)\b/],
+    ['Research', /\b(?:research|literature|papers?|academic|scientific|citations?|surveys?)\b/],
+    ['Data', /\b(?:data analysis|data science|datasets?|dataframes?|pandas|numpy|machine learning|ml|deep learning|etl|analytics|statistics|notebooks?|visuali[sz]ations?|llms?|embeddings?)\b/],
+    ['Games', /\b(?:games?|gameplay|game dev(?:elopment)?|roblox|luau|unity|godot|unreal|sprites?)\b/],
+    ['Development', /\b(?:code|coding|programming|refactor(?:ing)?|software|developers?|typescript|javascript|python|rust|golang|java|kotlin|swift|c\+\+|c#|git|code reviews?|apis?|sdks?|cli)\b/],
+  ];
+  const CATEGORY_NAMES = CATEGORIES.map(([name]) => name);
+
+  /** Categories a skill belongs to, from words in its name and description. */
+  function categorize(name, description) {
+    const text = `${String(name || '').replace(/[-_]+/g, ' ')} ${description || ''}`.toLowerCase();
+    return CATEGORIES.filter(([, re]) => re.test(text)).map(([cat]) => cat);
+  }
+
+  // ------------------------------------------------------------ security report
+
+  /**
+   * Plain-language details for every finding id. `risk` is the tier used when the
+   * finding blocks (critical or high); notes are always 'warning', informational
+   * findings 'info'. `kind`: threat (behaviour that is dangerous on its own),
+   * suspicious (often legitimate, worth a look), unverified (could not be checked),
+   * compat (Claude may not load it).
+   */
+  const RULE_INFO = {
+    'remote-pipe-to-shell': { title: 'Runs code downloaded from the internet', kind: 'threat', risk: 'critical', why: 'Whatever the server sends is executed straight away, without you seeing it. The server can change it at any time.', action: 'Do not install unless you trust the source and the exact URL. Prefer a pinned, reviewed script.' },
+    'powershell-download-exec': { title: 'PowerShell download-and-run', kind: 'threat', risk: 'critical', why: 'Downloads PowerShell code and executes it in memory, a common way to deliver malware on Windows.', action: 'Do not install unless you can read and trust what is downloaded.' },
+    'encoded-exec': { title: 'Runs a hidden, encoded payload', kind: 'threat', risk: 'critical', why: 'Encoding hides what the code does from reviewers and scanners, then runs it.', action: 'Treat as malicious unless the author explains it. Decode it and review before installing.' },
+    'reverse-shell': { title: 'Opens remote access to this computer', kind: 'threat', risk: 'critical', why: 'Connects a shell on this computer to a remote machine, giving someone else control.', action: 'Do not install.' },
+    'credential-access': { title: 'Reads passwords, keys or tokens', kind: 'threat', risk: 'critical', why: 'Reads SSH keys, cloud credentials, password stores or saved Windows credentials that a skill should never need.', action: 'Do not install unless reading that credential is the stated purpose of the skill.' },
+    'credential-exfiltration': { title: 'Credentials plus network access', kind: 'threat', risk: 'critical', why: 'The same file touches secret files and sends data over the network, the shape of credential theft.', action: 'Review exactly what is sent where before installing.' },
+    'browser-credential-access': { title: 'Reads browser passwords or cookies', kind: 'threat', risk: 'critical', why: 'Browser password and cookie stores give access to your accounts.', action: 'Do not install.' },
+    'secret-exfiltration': { title: 'Sends secrets to a remote server', kind: 'threat', risk: 'critical', why: 'Environment variables and API keys are sent off this computer.', action: 'Do not install.' },
+    'exfil-webhook': { title: 'Sends data to a capture or tunnel service', kind: 'threat', risk: 'critical', why: 'Webhook capture sites and tunnels are commonly used to collect stolen data.', action: 'Do not install unless the endpoint is clearly yours.' },
+    'destructive-command': { title: 'Deletes large parts of the system', kind: 'threat', risk: 'critical', why: 'Removes the home folder, a whole drive or similar, which cannot be undone.', action: 'Do not install.' },
+    'crypto-miner': { title: 'Crypto-mining', kind: 'threat', risk: 'critical', why: 'Uses your computer to mine cryptocurrency for someone else.', action: 'Do not install.' },
+    'disguised-executable': { title: 'Program disguised as another file type', kind: 'threat', risk: 'critical', why: 'A real program hidden behind a harmless-looking extension is a classic malware trick.', action: 'Do not install.' },
+    'lolbin-exec': { title: 'Windows tool used to fetch or run code', kind: 'threat', risk: 'high', why: 'certutil, bitsadmin, mshta, regsvr32 and rundll32 are abused to download and run code while looking like normal Windows activity.', action: 'Review the command. Legitimate skills rarely need these tools.' },
+    'persistence': { title: 'Starts automatically', kind: 'threat', risk: 'high', why: 'Adds itself to login items, shell profiles or scheduled tasks so it keeps running after the skill is done.', action: 'Only install if staying resident is the stated purpose.' },
+    'claude-config-tampering': { title: "Changes Claude's own settings", kind: 'threat', risk: 'high', why: "Editing Claude's settings or permissions can let later commands run without asking you.", action: 'Do not install unless you want those settings changed.' },
+    'security-tampering': { title: 'Disables security tools or hides activity', kind: 'threat', risk: 'high', why: 'Turning off antivirus, SELinux or shell history is used to avoid detection.', action: 'Do not install.' },
+    'prompt-injection': { title: 'Tries to override Claude or hide actions', kind: 'threat', risk: 'high', why: 'Text that tells Claude to ignore its instructions or keep things from you can make Claude act against you.', action: 'Read the flagged text. Do not install if it hides actions from you.' },
+    'hidden-unicode': { title: 'Invisible characters', kind: 'threat', risk: 'high', why: 'Invisible or direction-changing characters can hide instructions that Claude reads but you do not see.', action: 'Do not install until the characters are explained or removed by the author.' },
+    'hidden-file-name': { title: 'Invisible characters in a file name', kind: 'threat', risk: 'high', why: 'Hidden characters make a file look like something it is not.', action: 'Do not install.' },
+    'embedded-payload': { title: 'Long encoded blob', kind: 'suspicious', risk: 'high', why: 'A long base64 block in a script often hides code or data that cannot be reviewed.', action: 'Find out what the blob contains before installing.' },
+    'obfuscated-code': { title: 'Obfuscated code', kind: 'suspicious', risk: 'high', why: 'Building commands from character codes hides what they do. Honest code rarely needs it.', action: 'Decode the flagged line and review it before installing.' },
+    'setup-commands': { title: 'System setup commands', kind: 'suspicious', risk: 'high', why: 'Enables services, edits schedules or touches credential files. Common in setup scripts, but worth confirming.', action: 'Check the command matches what the skill says it does.' },
+    'env-harvesting': { title: 'Saves all environment variables', kind: 'suspicious', risk: 'high', why: 'Environment variables often hold API keys and tokens. Dumping them all is a first step in stealing them.', action: 'Check where the saved copy goes and whether it is needed.' },
+    'raw-ip-endpoint': { title: 'Connects to a raw IP address', kind: 'suspicious', risk: 'high', why: 'Legitimate services usually have a domain name. A bare public IP can point at an attacker-controlled server.', action: 'Check who owns that address before installing.' },
+    'network-access': { title: 'Makes network requests', kind: 'info', risk: 'info', why: 'Scripts in this skill can send or receive data over the internet. That is normal for many skills.', action: 'Make sure network use fits what the skill is for.' },
+    'soft-hyphen': { title: 'Invisible soft hyphens', kind: 'suspicious', risk: 'high', why: 'Usually harmless copy-paste residue, but invisible characters can hide text.', action: 'Usually safe to ignore.' },
+    'executable-binary': { title: 'Contains a program', kind: 'unverified', risk: 'high', why: 'Compiled programs cannot be read or scanned, so their behaviour is unknown.', action: 'Only install if you trust the author and need the program.' },
+    'archive': { title: 'Contains an archive', kind: 'unverified', risk: 'high', why: 'Archives are not opened by the scanner, so their contents are unknown.', action: 'Only install if you trust the author.' },
+    'oversized-file': { title: 'File too large to check', kind: 'unverified', risk: 'high', why: 'Files over the size limit are not scanned.', action: 'Only install if you trust the author.' },
+    'oversized-skill': { title: 'Skill too large to check', kind: 'unverified', risk: 'high', why: 'The skill is over the total size limit, so it was not fully scanned.', action: 'Only install if you trust the author.' },
+    'mismatched-file-type': { title: 'File content does not match its type', kind: 'unverified', risk: 'high', why: 'The file is not what its extension says, so it could not be checked as that type.', action: 'Only install if you trust the author.' },
+    'binary-file': { title: 'Binary file', kind: 'unverified', risk: 'high', why: 'Binary content cannot be read by the scanner.', action: 'Only install if you trust the author.' },
+    'submodule': { title: 'Links to another repository', kind: 'unverified', risk: 'high', why: 'Git submodules point at other code that was not downloaded or checked.', action: 'The linked code is not installed. Check the skill still works without it.' },
+    'symlink': { title: 'Symbolic link', kind: 'unverified', risk: 'high', why: 'The link target could not be followed, so it is installed as a plain file.', action: 'Check the skill still works.' },
+    'vendored-directory': { title: 'Bundled dependencies skipped', kind: 'unverified', risk: 'high', why: 'Folders such as node_modules are not checked and not installed.', action: 'The skill may need you to install its dependencies yourself.' },
+    'too-many-files': { title: 'Too many files to check', kind: 'unverified', risk: 'high', why: 'Only the first files were checked, and the rest are not installed.', action: 'Import a folder link that points at the skill itself.' },
+    'scan-budget': { title: 'Skipped to stay within the size budget', kind: 'unverified', risk: 'high', why: 'The skill is too large to check in one go; this file is not installed.', action: 'Import a smaller folder, or review the file yourself.' },
+    'download-failed': { title: 'File could not be downloaded', kind: 'unverified', risk: 'high', why: 'The file was not checked and will not be installed.', action: 'Try the import again later.' },
+    'skill-md-unavailable': { title: 'SKILL.md could not be read', kind: 'unverified', risk: 'high', why: 'Without SKILL.md the skill cannot be checked or loaded.', action: 'Try the import again later.' },
+    'tree-truncated': { title: 'Repository too large to list', kind: 'unverified', risk: 'high', why: 'GitHub cut the file list short, so some files may be missing.', action: 'Import a folder link that points at the skill itself.' },
+    'missing-skill-md': { title: 'No SKILL.md', kind: 'compat', risk: 'high', why: 'Claude Code only loads folders that contain a SKILL.md file.', action: 'Add a SKILL.md with a name and description.' },
+    'claude-compat': { title: 'Claude Code cannot load it', kind: 'compat', risk: 'high', why: 'The SKILL.md frontmatter has a problem that stops Claude Code from loading the skill.', action: 'Fix the frontmatter (name and description).' },
+    'bad-file-name': { title: 'File name not allowed on Windows', kind: 'compat', risk: 'high', why: 'Windows cannot create this file, so the skill cannot be installed there.', action: 'Rename the file.' },
+  };
+
+  const RISK_ORDER = { critical: 0, high: 1, warning: 2, info: 3 };
+
+  /**
+   * A finding with its report details: `risk` (critical | high | warning | info),
+   * `kind`, `title`, `why` and `action`. Notes found in documentation keep the
+   * rule's explanation but are rated 'warning', because instructions for a human
+   * are not executed by the skill.
+   */
+  function describeFinding(finding) {
+    const info = RULE_INFO[finding.rule] || { title: finding.message, kind: 'suspicious', risk: 'high', why: '', action: 'Review the flagged file.' };
+    let risk;
+    if (finding.severity === 'block') risk = info.risk === 'info' ? 'high' : info.risk;
+    else if (finding.severity === 'info' || finding.severity === 'allowed') risk = 'info';
+    else risk = 'warning';
+    const kind = finding.severity === 'allowed' ? 'reviewed' : finding.severity === 'unverified' ? 'unverified' : finding.severity === 'invalid' ? 'compat' : info.kind;
+    let why = info.why;
+    if (finding.severity === 'warn' && info.kind === 'threat') why = `${why} Here it appears in documentation or a mild form, so it is reported as a note rather than blocked.`;
+    if (finding.severity === 'allowed') why = 'This exact file was reviewed and accepted as safe by the library maintainers.';
+    return { ...finding, risk, kind, title: info.title, why, action: finding.severity === 'allowed' ? 'No action needed.' : info.action };
+  }
+
+  /**
+   * Overall result for a list of findings: `level` is the worst risk present, or
+   * 'clean' when nothing was found. Counts are per risk tier. A clean result
+   * means no known pattern matched; it is not a guarantee of safety.
+   */
+  function summarizeFindings(findings) {
+    const counts = { critical: 0, high: 0, warning: 0, info: 0 };
+    const described = (findings || []).map(describeFinding).sort((a, b) => RISK_ORDER[a.risk] - RISK_ORDER[b.risk]);
+    for (const f of described) counts[f.risk]++;
+    const level = counts.critical ? 'critical' : counts.high ? 'high' : counts.warning ? 'warning' : counts.info ? 'info' : 'clean';
+    return { level, counts, findings: described };
   }
 
   /** Read one inline YAML scalar: quoted strings unescaped, plain ones without a trailing comment. */
@@ -589,8 +742,13 @@
     MAX_FILE_BYTES,
     MAX_SKILL_BYTES,
     RULES,
+    RULE_INFO,
+    CATEGORY_NAMES,
+    categorize,
     checkClaudeCompat,
     classifyFile,
+    describeFinding,
+    summarizeFindings,
     IGNORED_DIR_NAMES,
     IGNORED_FILE_NAMES,
     decodeText,
