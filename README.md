@@ -12,8 +12,12 @@ it, checking it is safe, and copying it into the right hidden folder. Prabh's CS
 does all of that for you, and it never installs a skill without scanning it first.
 
 - **331 ready-to-use skills** bundled in the app, all scanned before they ship
-- **Safety scan** on every skill, including ones you add from GitHub
-- **One-click install** into Claude Code, with update, remove and undo
+- **Security report** for every skill, including ones you add from GitHub, with
+  risk levels, exact file and line, and what to do
+- **One-click install** into personal or project skill folders, with update,
+  compare, remove and undo
+- **Update center** for library and GitHub skills, with diffs before anything changes
+- **Skill editor** for multi-file skills, with live checks and preview
 - **A real Windows app** with its own window and Start-menu entry, plus a
   browser version for any computer
 - **Works offline**: no account, no tracking, no server
@@ -101,21 +105,43 @@ itself every time it starts. Browsers may ask you to click **Reconnect** after
 they restart, because they reset folder access.
 
 Skills in this folder work in every project. To install a skill for a single
-project, use the folder switcher to add the project's folder. The app then
-installs into `<project>/.claude/skills`.
+project, add the project's folder on the **Projects** page or with the folder
+switcher. The app then installs into `<project>/.claude/skills`.
 
-### 2. Find skills
+### 2. Home
 
-- **All skills**: the full library. Search by name or by what a skill does, or
-  click a topic chip such as `roblox`, `testing` or `security`. Skills marked **Made for Prabh's CSC** were
-  written for this app.
-- **Preview**: shows what a skill contains, its safety-scan result, and a
-  **Try it in Claude** example request you can copy.
+The **Home** page shows real numbers from your library and folders: skills in
+the library, skills installed, personal and project skills, updates available,
+and skills that need a security look. It also lists what you added, installed
+and scanned recently, and has quick actions for the common jobs. In the desktop
+app, **Open skills folder** opens `~/.claude/skills` in File Explorer.
+
+### 3. Find skills
+
+- **All skills**: the full library. Search by name, description or category,
+  click a topic chip such as `roblox` or `testing`, or use the filters:
+  - **Category**: Development, Frontend, Backend, Debugging, Testing, Security,
+    DevOps, Design, Documentation, Productivity, Research, Data or Games. A skill
+    only gets a category when its own name or description uses that category's
+    words, so some skills have none.
+  - **Status**: installed, not installed, update available, or needs a security review.
+  - **Sort**: by name, category, or most recently updated.
+- **Details**: click **Details** on any card to see:
+  - **Overview**: source, commit, categories, file count and size, every
+    frontmatter field, and whether Claude Code will load it.
+  - **SKILL.md**: formatted or as raw text.
+  - **Files**: every file, with line numbers. Lines with security findings are
+    highlighted.
+  - **Security**: the full security report (see below).
+  - **Install**: exactly where the skill is installed, when it was last
+    modified, and which of your other folders also have it.
 - **Selected**: the skills you have ticked.
 - **Installed**: what is in your connected skills folder right now, including
   skills you installed some other way.
 
-### 3. Install
+Skills marked **Made for Prabh's CSC** were written for this app.
+
+### 4. Install
 
 Tick the skills you want and click **Install** in the **Connect to Claude** panel.
 After installing, the app reads each skill back to confirm Claude Code will
@@ -129,15 +155,40 @@ The panel offers two other ways to use skills:
 | **CLAUDE.md** | A block to paste into a project's `CLAUDE.md` that helps Claude pick the right skills |
 | **Claude API** | A system prompt that contains the selected skills, for your own API apps |
 
-### Updates, removal and undo
+Installing never overwrites anything silently. If a skill is already installed,
+the app asks first, backs up the current copy, writes the new files, reads them
+back to verify them, and puts the old copy back if anything fails.
 
-- When a bundled skill has a newer version than the one you installed, its card
-  shows **Update**.
-- **History** lists every install, update and removal. Recent changes can be
-  undone, which restores the files that were there before. The app warns you if
-  you have edited a skill since then, because undo would discard those edits.
-- **Re-scan installed** runs the current safety rules over everything already
-  in your skills folder.
+### Personal and project skills
+
+The **Projects** page lists your personal skills folder and every project folder
+you added, with how many skills each holds. From there you can switch where
+skills install, see a folder's skills and its history, and remove a project from
+the list (its files are not touched). A comparison table shows which skills are
+in which folders, and flags names that are installed in more than one place.
+
+### Updates
+
+The **Updates** page only shows updates that really exist:
+
+- **Library versions**: installed skills whose files differ from the library's
+  copy. **Compare** shows a line-by-line diff before you update.
+- **GitHub imports**: **Check GitHub for updates** looks up the newest commit of
+  each repository, and asks GitHub which files changed since the commit you
+  imported. A skill only counts as updated when files in its own folder changed.
+  **Review update** downloads the new version, scans it, and shows the diff and
+  its security report. Nothing changes until you accept. The previous version
+  is kept, so you can restore it.
+
+### History, removal and undo
+
+- **History** lists every install, update, removal, GitHub import, skill you
+  created or edited, and security scan, with the date and the result. Filter it
+  by type or by folder.
+- Recent installs, updates and removals can be undone. Undo restores the files
+  that were there before, and warns you if you edited a skill since then.
+- **Security > Scan installed skills** runs the current rules over everything
+  already in your skills folder.
 - The app warns when two folders contain a skill with the same name, because
   Claude would see duplicates.
 
@@ -146,21 +197,47 @@ The panel offers two other ways to use skills:
 1. Click **Add from GitHub**, paste a link to a public repository, and click
    **Scan**. Any of these work: a repo, a branch, a folder, a link to a
    `SKILL.md` file, or the short form `owner/repo`.
-2. The app downloads the files and scans every skill it finds. Each one is
-   labelled **Passed safety scan**, a warning, or blocked.
-3. Choose the skills you want and click **Add to library**. Blocked skills
+2. The app shows the repository, its author, the branch and the exact commit it
+   resolved. It downloads the files, with a progress bar, and scans every skill
+   it finds on this computer.
+3. Each skill shows its scan result and risk level, how many files it has, and
+   whether it clashes with a skill already in your library or installed.
+   **Details and files** opens the full view before you decide.
+4. Choose the skills you want and click **Add to library**. Blocked skills
    cannot be chosen, and the app asks before adding one it could not fully check.
+
+GitHub content is never trusted just because it is on GitHub: every imported
+skill goes through the same scanner. Large repositories are capped (30 skills,
+300 files and 15 MB per skill per scan), and the app stops politely when it
+reaches GitHub's limit for lookups without signing in.
 
 Click **Watch this repo** to keep an eye on a repository. The app checks it for new
 commits at most once an hour, and a notice appears when there are changes to
 re-scan.
 
-### Create your own skill
+### Create and edit skills
 
-Click **Create a skill** and fill in a name, a description and instructions.
-Live checks show whether the skill follows the naming rules, whether Claude
-will recognise it, and whether it passes the safety scan. Your skills are saved
-in the library and can be edited or deleted later.
+Click **Create a skill**, or **Edit a copy** on any skill's details:
+
+- The name and description fields write the `SKILL.md` frontmatter for you.
+  The instructions start from a template (When to Use, How It Works, Examples).
+- Add supporting files and folders (`scripts/`, `references/`, `assets/`),
+  rename them, delete them, and edit text files in place.
+- **Preview** shows the Markdown formatted.
+- Live checks show whether the name follows the rules, whether Claude Code and
+  the Claude app will load the skill, and the safety-scan result for **every**
+  file. A file detected as dangerous blocks saving.
+- **Export .zip** saves the finished skill as a zip file.
+
+Your skills are saved in the library and can be edited, installed or deleted later.
+
+### Settings
+
+Theme (match Windows, light or dark), start page, default install location,
+whether to ask before removing a skill, how many recent changes keep a backup,
+clearing history, whether skills that could not be fully checked may be
+installed at all, and automatic checks of watched repositories. The About
+section shows the version and links to this repository.
 
 ---
 
@@ -170,28 +247,43 @@ Every file in a skill is checked before it can be installed. The same rules run
 in the app, in the build that bundles the library, and in this repository's
 tests. They live in [`scripts/lib/skill-scan-core.js`](scripts/lib/skill-scan-core.js).
 
-Each finding gets one of three levels:
+Every skill gets a **security report**. It shows the overall risk and, for each
+finding:
 
-| Level | Meaning |
+- the risk tier
+- whether it is a detected threat or a suspicious pattern
+- the exact file and line, with a **View** button that jumps to it
+- what was detected, why it matters, and what to do
+
+| Risk | Meaning |
 |---|---|
-| **Block** | Looks dangerous. The skill cannot be installed. |
-| **Warn** | Allowed, but shown so you can check it is expected. |
-| **Unverified** | Could not be checked (for example, the file is too large). The app asks before installing; the bundled library never ships these. |
+| **Critical** | A known dangerous pattern, such as running downloaded code, stealing credentials, or a reverse shell. The skill cannot be installed. |
+| **High** | Strongly suspicious, such as obfuscated code, starting at login, or disabling security tools. Blocked in scripts. |
+| **Warning** | Worth a look: a pattern that is often legitimate, a risky command mentioned in documentation, or a part that could not be checked. |
+| **Info** | Informational only, such as "makes network requests", or a finding the library maintainers reviewed. |
 
 Patterns it looks for include:
 
 - Downloading a script and running it immediately (`curl … | sh`, PowerShell download-and-run)
-- Hidden or encoded payloads that are decoded and run
+- Windows tools abused to fetch or run code (`certutil`, `bitsadmin`, `mshta`, `regsvr32`, `rundll32`)
+- Hidden, encoded or obfuscated code (base64 payloads, character-code tricks, encoded PowerShell)
 - Reverse shells and remote access
-- Reading passwords, SSH keys, browser password stores or cookies
-- Sending secrets or environment variables to a remote server or webhook
+- Reading passwords, SSH keys, cloud credentials, Windows saved credentials, or
+  browser password and cookie stores
+- Dumping every environment variable, or sending secrets to a remote server or webhook
+- Connections to bare public IP addresses
 - Destructive commands, such as wiping the home folder or a disk
 - Making something start automatically at login or on a schedule
 - Changing Claude's own settings or permissions, or turning off security tools
 - Crypto miners
 - Prompt injection: text aimed at overriding Claude or hiding actions from you
 - Invisible or direction-changing Unicode characters that can hide instructions
-- Executable binaries, oversized files, and file names Windows cannot store
+- Executable binaries, archives, oversized files, and file names Windows cannot store
+
+The **Security** page shows these results for the whole library, scans your
+installed skills on demand, lists recent scans and imports, and explains every
+rule. Scanning is entirely local. The scanner never removes or changes anything
+by itself.
 
 The scan also checks that Claude will recognise the skill: a valid `SKILL.md`
 with a correct name and description.
@@ -211,10 +303,12 @@ skills from sources you do not trust before installing them.
   ([`desktop/main.js`](desktop/main.js)), and links open in your normal browser.
 - **Files.** The app can only read and write the folders you pick in the folder
   picker. It cannot see anything else on your computer. In the desktop app, the
-  page has no access to Node.js or the rest of the system.
-- **Stored data.** Your library additions, history and backups for undo are
-  kept in local storage (IndexedDB) on your own computer. The theme choice is
-  stored in `localStorage`.
+  page has no access to Node.js or the rest of the system. It can make exactly
+  two requests to the app itself ([`desktop/preload.js`](desktop/preload.js)):
+  open `~/.claude/skills` in File Explorer, and read the app version.
+- **Stored data.** Your library additions, history, activity log, settings and
+  backups for undo are kept in local storage (IndexedDB) on your own computer.
+  The theme choice is stored in `localStorage`.
 
 ---
 
@@ -242,7 +336,7 @@ npm install
 |---|---|
 | `npm start` | Runs the desktop app from source |
 | `npm run build` | Scans `skills/` and regenerates `apps/skill-connector/data` |
-| `npm test` | Checks that the app's files and data match `skills/` |
+| `npm test` | Checks that the app's files and data match `skills/`, and unit-tests the scanner |
 | `npm run check` | Full browser test of the app with Playwright |
 | `npm run check:desktop` | Launches the desktop app and checks it loads and stays locked down |
 | `npm run claude-e2e` | Installs a test skill through the app and confirms Claude Code uses it. Needs a signed-in `claude` CLI. |
@@ -282,6 +376,7 @@ apps/skill-connector/
   data/                         generated by npm run build: skill index, files, scan rules
 desktop/
   main.js, app.ico              the desktop app (Electron) that hosts the page
+  preload.js                    the two desktop-only calls the page may use
 skills/                         source of the bundled skills
 config/
   skill-scan-allowlist.json     reviewed exceptions to scan findings
@@ -292,7 +387,8 @@ scripts/
   desktop-check.js              desktop app smoke test
   lib/                          safety scan, skill index, zip writer
   ci/scan-skills.js             scans skills/ in CI
-tests/ci/                       app and data consistency tests
+tests/ci/                       app, data and scanner tests
+docs/UPGRADE-PLAN.md            what was reviewed and changed in the skill-manager redesign
 ```
 
 ---
