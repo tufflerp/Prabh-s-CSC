@@ -96,6 +96,10 @@ npm start
 3. Click **Select folder**. In the browser version, also click **Edit files**
    when the browser asks.
 
+You only do this once. The desktop app remembers the folder and reconnects by
+itself every time it starts. Browsers may ask you to click **Reconnect** after
+they restart, because they reset folder access.
+
 Skills in this folder work in every project. To install a skill for a single
 project, use the folder switcher to add the project's folder. The app then
 installs into `<project>/.claude/skills`.

@@ -2698,7 +2698,7 @@
   renderChips();
   renderAll();
   // Saved skills load before the first look at the skills folder, so they are recognised as installed.
-  Promise.all([
+  const ready = Promise.all([
     SUPPORTS_FOLDER_WRITE ? loadTargets() : null,
     idbGet('history'),
     loadCustom(),
@@ -2719,6 +2719,24 @@
     setInterval(() => checkWatched(false), WATCH_INTERVAL); // while the app stays open
   }
 
-  // Exposed for automated checks (scripts/skill-connector-check.js).
-  window.SkillConnector = { scanGitHub, parseGitHubUrl, statusOf, prepareForClaudeApp, refreshInstalled, addProjectTarget, switchTarget, checkWatched, isBusy: () => busy };
+  /**
+   * Win back access to the saved folder without the user clicking Reconnect. Browsers
+   * forget the permission on restart; the desktop app calls this at launch with a user
+   * gesture, and its permission handler allows folders the user picked before.
+   */
+  async function restoreAccess() {
+    await ready;
+    const target = currentTarget();
+    if (!target || connection !== 'needs-permission') return connection;
+    try {
+      if (await ensureAccess(target)) await refreshInstalled();
+    } catch {
+      // Folder gone or access refused: stay on "Reconnect".
+    }
+    renderAll();
+    return connection;
+  }
+
+  // Exposed for the desktop app and automated checks (scripts/skill-connector-check.js).
+  window.SkillConnector = { scanGitHub, parseGitHubUrl, statusOf, prepareForClaudeApp, refreshInstalled, restoreAccess, addProjectTarget, switchTarget, checkWatched, isBusy: () => busy };
 })();

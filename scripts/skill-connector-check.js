@@ -164,8 +164,12 @@ function installFakeFolder() {
     },
     async isSameEntry(other) { return Boolean(other) && other.kind === 'directory' && other.__prefix === prefix; },
     __prefix: prefix,
-    async queryPermission() { return 'granted'; },
-    async requestPermission() { return 'granted'; },
+    // window.__fakePermission = 'prompt' acts like a restart: access must be asked for again.
+    async queryPermission() { return window.__fakePermission || 'granted'; },
+    async requestPermission() {
+      window.__fakePermission = null;
+      return 'granted';
+    },
   });
   window.__fakeFiles = files;
   // The personal folder is the root; a project folder lives under "project/".
@@ -297,6 +301,16 @@ async function main() {
     const installedText = await page.evaluate(() => new TextDecoder().decode(new Uint8Array(window.__fakeFiles['roblox-development/SKILL.md'])));
     check(installedText === fs.readFileSync(path.join(__dirname, '..', 'skills', 'roblox-development', 'SKILL.md'), 'utf8'), 'installed SKILL.md is byte-identical to the library');
     check((await page.textContent('#claude-status')).includes('connected · 3 skills'), 'sidebar shows the connection and installed count');
+
+    console.log('Stay connected after a restart');
+    await page.evaluate(async () => {
+      window.__fakePermission = 'prompt';
+      await window.SkillConnector.refreshInstalled();
+    });
+    const restored = await page.evaluate(() => window.SkillConnector.restoreAccess());
+    check(restored === 'connected' && (await page.evaluate(() => window.__fakePermission === null)), 'restoreAccess asks for access again and reconnects without the picker');
+    check(!(await page.locator('#connect-claude').count()), 'no Reconnect button after restoring access');
+    check((await page.textContent('#claude-status')).includes('connected · 3 skills'), 'installed count is back after restoring access');
 
     console.log('Sync with Claude Code');
     await page.click('[data-view="installed"]');

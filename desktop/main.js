@@ -57,6 +57,14 @@ function createWindow() {
     },
   });
   win.once('ready-to-show', () => win.show());
+  // Reconnect the saved skills folder so Connect is only ever needed once. Chromium
+  // forgets folder access on restart and only asks again after a click, so this runs
+  // as a user gesture; the permission handler above then allows it.
+  win.webContents.on('did-finish-load', () => {
+    win.webContents
+      .executeJavaScript('window.SkillConnector && window.SkillConnector.restoreAccess()', true)
+      .catch(() => {});
+  });
   win.webContents.setWindowOpenHandler(({ url }) => {
     openExternal(url);
     return { action: 'deny' };
