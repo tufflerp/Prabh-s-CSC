@@ -25,3 +25,5 @@ jobs:
           git diff --exit-code -- apps/skill-connector/data
       - run: npm test
       - run: npm run check
+      - name: Desktop app smoke test
+        run: xvfb-run -a npm run check:desktop

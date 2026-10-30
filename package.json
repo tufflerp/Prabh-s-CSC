@@ -1,19 +1,59 @@
 {
   "name": "prabhs-csc",
+  "productName": "Prabh's CSC",
   "version": "1.0.0",
   "private": true,
   "description": "Prabh's CSC (Claude Skill Connector): browse safety-checked skills and install them into Claude Code.",
+  "author": "Prabh",
   "license": "MIT",
+  "main": "desktop/main.js",
   "scripts": {
+    "start": "electron .",
     "build": "node scripts/skill-connector-build.js",
     "check": "node scripts/skill-connector-check.js",
+    "check:desktop": "node scripts/desktop-check.js",
     "package": "node scripts/skill-connector-package.js",
-    "installer": "node scripts/skill-connector-installer.js",
+    "installer": "npm run build && electron-builder --win --publish never",
     "artifact": "node scripts/skill-connector-artifact.js",
     "claude-e2e": "node scripts/skill-connector-claude-e2e.js",
     "test": "node tests/ci/skill-connector-app.test.js"
   },
+  "build": {
+    "appId": "com.tufflerp.prabhs-csc",
+    "productName": "Prabhs-CSC",
+    "executableName": "Prabhs-CSC",
+    "directories": {
+      "output": "dist/desktop"
+    },
+    "files": [
+      "desktop/**",
+      "apps/skill-connector/**",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ],
+      "icon": "desktop/app.ico",
+      "artifactName": "Prabhs-CSC-${version}-win-x64.${ext}"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "runAfterFinish": true,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "Prabh's CSC",
+      "uninstallDisplayName": "Prabh's CSC",
+      "installerIcon": "desktop/app.ico",
+      "uninstallerIcon": "desktop/app.ico",
+      "artifactName": "Prabhs-CSC-Setup-${version}.${ext}"
+    }
+  },
   "devDependencies": {
+    "electron": "45.1.0",
+    "electron-builder": "26.18.0",
     "js-yaml": "4.3.2",
     "playwright": "1.64.1"
   },
@@ -27,5 +67,8 @@
   "homepage": "https://github.com/tufflerp/Prabh-s-CSC#readme",
   "bugs": {
     "url": "https://github.com/tufflerp/Prabh-s-CSC/issues"
+  },
+  "allowScripts": {
+    "electron-winstaller": false
   }
 }

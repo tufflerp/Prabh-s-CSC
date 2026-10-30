@@ -23,6 +23,9 @@ npx playwright install chromium
 2. Make your change:
    - **App:** `apps/skill-connector/app.js`, `index.html` and `boot.js`.
      These are plain JavaScript and HTML, with no framework and no build step.
+     Run `npm start` to try your change in the desktop app.
+   - **Desktop window:** `desktop/main.js`. Keep the page sandboxed and the
+     network limited to GitHub.
    - **Skills:** add or edit a folder under `skills/`. Each skill needs a
      `SKILL.md` with `name` and `description` frontmatter.
    - **Scan rules:** `scripts/lib/skill-scan-core.js`.
@@ -33,6 +36,7 @@ npx playwright install chromium
    ```bash
    npm test
    npm run check
+   npm run check:desktop
    ```
 
 5. Open a pull request that says what changed and why.

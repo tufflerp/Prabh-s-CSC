@@ -1,5 +1,8 @@
 # Prabh's CSC
 
+[![CI](https://github.com/tufflerp/Prabh-s-CSC/actions/workflows/ci.yml/badge.svg)](https://github.com/tufflerp/Prabh-s-CSC/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Claude Skill Connector**: browse safety-checked skills and install them into
 Claude Code with one click.
 
@@ -11,6 +14,8 @@ does all of that for you, and it never installs a skill without scanning it firs
 - **331 ready-to-use skills** bundled in the app, all scanned before they ship
 - **Safety scan** on every skill, including ones you add from GitHub
 - **One-click install** into Claude Code, with update, remove and undo
+- **A real Windows app** with its own window and Start-menu entry, plus a
+  browser version for any computer
 - **Works offline**: no account, no tracking, no server
 - **Open source** (MIT): everything the app does is in this repository
 
@@ -22,7 +27,7 @@ does all of that for you, and it never installs a skill without scanning it firs
 - [Using the app](#using-the-app)
 - [How the safety scan works](#how-the-safety-scan-works)
 - [Privacy and what the app can touch](#privacy-and-what-the-app-can-touch)
-- [Browser support](#browser-support)
+- [Where it runs](#where-it-runs)
 - [For developers](#for-developers)
 - [Project layout](#project-layout)
 - [Contributing, security and license](#contributing-security-and-license)
@@ -31,34 +36,49 @@ does all of that for you, and it never installs a skill without scanning it firs
 
 ## Install
 
-### Windows installer
+All downloads are on the [Releases](https://github.com/tufflerp/Prabh-s-CSC/releases)
+page. GitHub Actions builds every release from the tagged source in this
+repository, so what you download matches the code you can read here.
 
-1. Download `Prabhs-CSC-Setup.exe` from the [Releases](https://github.com/tufflerp/Prabh-s-CSC/releases) page.
-2. Run it. It installs for your user only, so no administrator rights are needed.
+### Windows desktop app (recommended)
+
+1. Download `Prabhs-CSC-Setup-<version>.exe` (about 125 MB).
+2. Run it. It installs for your user only, so no administrator rights are
+   needed, and opens the app when it finishes.
    - Files go to `%LOCALAPPDATA%\Programs\Prabhs-CSC`.
    - It adds a **Prabh's CSC** shortcut to the Start menu and the desktop.
 3. To remove it, go to **Settings > Apps > Installed apps > Prabh's CSC > Uninstall**.
 
-> **Smart App Control.** The installer is not code-signed yet. On Windows 11
-> PCs with Smart App Control turned on, Windows blocks unsigned programs, and it
-> offers no "run anyway" option. If that happens, use the portable zip below.
-> SmartScreen may also show "Windows protected your PC"; choose
-> **More info > Run anyway** only if you downloaded the file from this repository.
+The desktop app is the same app in its own window, built with
+[Electron](https://www.electronjs.org). It cannot reach any website except
+GitHub (see [Privacy](#privacy-and-what-the-app-can-touch)).
 
-### Portable zip (no installer)
+> **The app is not code-signed yet.** Windows SmartScreen may show "Windows
+> protected your PC". Choose **More info > Run anyway** only if you downloaded the
+> file from this repository's Releases page. On PCs with Smart App Control, Windows
+> may block unsigned programs outright. If it does, use the browser version below.
 
-1. Download `Prabhs-CSC.zip` from [Releases](https://github.com/tufflerp/Prabh-s-CSC/releases).
+**No installer:** download `Prabhs-CSC-<version>-win-x64.zip`, extract it, and
+run `Prabhs-CSC.exe`.
+
+### Browser version (any computer)
+
+1. Download `Prabhs-CSC.zip`.
 2. Right-click it, choose **Extract All**, and open the extracted folder.
-3. Double-click **Open Prabh's CSC.bat**. It opens the app in a Microsoft Edge
-   window. Or open **Prabh's CSC.html** in Chrome or Edge.
+3. Double-click **Open Prabh's CSC.bat** (Windows), or open **Prabh's CSC.html**
+   in Chrome or Edge.
 
-### From source
+### From source (Windows, macOS, Linux)
 
 ```bash
 git clone https://github.com/tufflerp/Prabh-s-CSC
+cd Prabh-s-CSC
+npm install
+npm start
 ```
 
-Then open `apps/skill-connector/index.html` in Chrome or Edge.
+`npm start` opens the desktop app. You can also open
+`apps/skill-connector/index.html` in Chrome or Edge without installing anything.
 
 ---
 
@@ -73,7 +93,8 @@ Then open `apps/skill-connector/index.html` in Chrome or Edge.
 
    `.claude` is a hidden folder. On Windows, paste the path into the picker's
    address bar. Create the `skills` folder if it does not exist yet.
-3. Click **Select folder**, then **Edit files** when the browser asks.
+3. Click **Select folder**. In the browser version, also click **Edit files**
+   when the browser asks.
 
 Skills in this folder work in every project. To install a skill for a single
 project, use the folder switcher to add the project's folder. The app then
@@ -182,21 +203,24 @@ skills from sources you do not trust before installing them.
 - **Network.** The app only goes online when you use **Add from GitHub** or
   watch a repository. Then it contacts `api.github.com` and
   `raw.githubusercontent.com`, and nothing else. The bundled library works fully offline.
+  The desktop app enforces this: it blocks every request to any other site
+  ([`desktop/main.js`](desktop/main.js)), and links open in your normal browser.
 - **Files.** The app can only read and write the folders you pick in the folder
-  picker, and only after you approve access in the browser. It cannot see
-  anything else on your computer.
+  picker. It cannot see anything else on your computer. In the desktop app, the
+  page has no access to Node.js or the rest of the system.
 - **Stored data.** Your library additions, history and backups for undo are
-  kept in your browser's local storage (IndexedDB) on your own computer. The
-  theme choice is stored in `localStorage`.
+  kept in local storage (IndexedDB) on your own computer. The theme choice is
+  stored in `localStorage`.
 
 ---
 
-## Browser support
+## Where it runs
 
-Installing straight into a folder uses the browser's File System Access API.
+Installing straight into a folder uses the File System Access API.
 
-| Browser | Support |
+| Where | Support |
 |---|---|
+| Desktop app (Windows; macOS and Linux from source) | Everything works |
 | Microsoft Edge, Google Chrome (desktop) | Everything works |
 | Firefox, Safari, mobile browsers | Browse, preview and scan work. Installs come as `.zip` downloads that you unzip into your skills folder. |
 
@@ -212,13 +236,23 @@ npm install
 
 | Command | What it does |
 |---|---|
+| `npm start` | Runs the desktop app from source |
 | `npm run build` | Scans `skills/` and regenerates `apps/skill-connector/data` |
 | `npm test` | Checks that the app's files and data match `skills/` |
 | `npm run check` | Full browser test of the app with Playwright |
+| `npm run check:desktop` | Launches the desktop app and checks it loads and stays locked down |
 | `npm run claude-e2e` | Installs a test skill through the app and confirms Claude Code uses it. Needs a signed-in `claude` CLI. |
-| `npm run package` | Builds the portable `dist/Prabhs-CSC.zip` |
-| `npm run installer` | Builds `dist/Prabhs-CSC-Setup.exe`. Needs NSIS (`makensis`). |
+| `npm run installer` | Builds the Windows installer and the no-installer zip in `dist/desktop` |
+| `npm run package` | Builds the browser version, `dist/Prabhs-CSC.zip` |
 | `npm run artifact` | Builds a single-page version for hosting as a claude.ai Artifact |
+
+### Releasing
+
+1. Update `version` in `package.json` and commit.
+2. Tag the commit and push the tag, for example
+   `git tag v1.0.1` then `git push origin v1.0.1`.
+3. The **Release** workflow builds the installer, the no-installer zip and the
+   browser zip on GitHub's Windows runners, and publishes them as a GitHub release.
 
 The browser tests use Playwright's Chromium. To use an installed browser
 instead, set `PLAYWRIGHT_CHROMIUM_PATH`, for example to the path of `msedge.exe`.
@@ -242,14 +276,16 @@ Optional: add a curated example request for the skill to `config/try-prompts.jso
 apps/skill-connector/
   index.html, app.js, boot.js   the app (no framework, no build step needed to run)
   data/                         generated by npm run build: skill index, files, scan rules
-  installer/                    NSIS script and icon for the Windows installer
+desktop/
+  main.js, app.ico              the desktop app (Electron) that hosts the page
 skills/                         source of the bundled skills
 config/
   skill-scan-allowlist.json     reviewed exceptions to scan findings
   original-skills.json          skills written for this app
   try-prompts.json              curated "Try it in Claude" examples
 scripts/
-  skill-connector-*.js          build, test, package and installer scripts
+  skill-connector-*.js          build, test and packaging scripts
+  desktop-check.js              desktop app smoke test
   lib/                          safety scan, skill index, zip writer
   ci/scan-skills.js             scans skills/ in CI
 tests/ci/                       app and data consistency tests

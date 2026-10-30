@@ -1,0 +1,41 @@
+name: Release
+
+# Push a tag such as v1.0.1 (matching "version" in package.json) to build the
+# downloads from that exact commit and publish them as a GitHub release.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Tag matches package.json version
+        shell: bash
+        run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+      - run: npm ci
+      - run: npm test
+      - name: Build the desktop installer and zip
+        run: npm run installer
+      - name: Build the browser version
+        run: npm run package
+      - name: Collect files and checksums
+        shell: bash
+        run: |
+          mkdir release
+          cp dist/desktop/Prabhs-CSC-Setup-*.exe dist/desktop/Prabhs-CSC-*-win-x64.zip dist/Prabhs-CSC.zip release/
+          cd release && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release/* --title "Prabh's CSC $GITHUB_REF_NAME" --generate-notes
