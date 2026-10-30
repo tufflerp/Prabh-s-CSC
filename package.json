@@ -14,10 +14,18 @@
     "test": "node tests/ci/skill-connector-app.test.js"
   },
   "devDependencies": {
-    "js-yaml": "4.3.0",
+    "js-yaml": "4.3.2",
     "playwright": "1.64.1"
   },
   "engines": {
     "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tufflerp/Prabh-s-CSC.git"
+  },
+  "homepage": "https://github.com/tufflerp/Prabh-s-CSC#readme",
+  "bugs": {
+    "url": "https://github.com/tufflerp/Prabh-s-CSC/issues"
   }
 }
